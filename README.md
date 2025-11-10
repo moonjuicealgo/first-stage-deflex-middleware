@@ -10,8 +10,8 @@
 - Handles **buy and sell taxes** automatically.
 - Works with **fixed-input** and **fixed-output** swaps.
 - Allows the optional designation of a First-Stage referral address which collects a portion of tax volume.
-- Integrates seamlessly with Txn lab's [Deflex](https://github.com/TxnLab/deflex-js) router js SDK.
-
+- Integrates seamlessly with TxnLab's [Deflex](https://github.com/TxnLab/deflex-js) router js SDK.
+- Published on npm: [first-stage-deflex-middleware](https://www.npmjs.com/package/first-stage-deflex-middleware)
 ---
 
 ## Installation
