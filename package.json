@@ -1,13 +1,13 @@
 {
   "name": "first-stage-deflex-middleware",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "commonjs",
   "scripts": {
-  "test-mainnet": "node -r ts-node/register tests/mainnetMiddlewareTest.ts",
-  "build": "tsc -p tsconfig.json"
-},
+    "test-mainnet": "node -r ts-node/register tests/mainnetMiddlewareTest.ts",
+    "build": "tsc -p tsconfig.json"
+  },
   "dependencies": {
     "@algorandfoundation/algokit-utils": "^9.1.2"
   },
