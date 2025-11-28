@@ -59,6 +59,16 @@ export class FirstStageMiddleware implements SwapMiddleware {
     return params.fromASAID !== 0n || params.toASAID !== 0n;
   }
 
+    private async hasUserBox(fsClient: FirstStageClient, address: string, assetId: bigint): Promise<boolean> {
+  try {
+    const key = getUserAssetBoxKey(Number(assetId), address);
+    await fsClient.appClient.getBoxValue(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async adjustQuoteParams(
   params: FetchQuoteParams & {
     address?: string
@@ -130,22 +140,13 @@ if (!optedIn) {
 
       const boxes = await this.getBoxReferences(address, assetId, algodClient);
 
-      if (assetId === fromASAID) {
-        const optedIn = await this.isOptedIn(address, assetId, algodClient);
-        if (!optedIn) {
-          const optInTxn = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
-            sender: address,
-            receiver: address,
-            assetIndex: Number(assetId),
-            amount: 0,
-            suggestedParams,
-          });
-          txns.push({ txn: optInTxn, signer });
-        }
+              const freezeEligible = await this.isFreezeEligible(fsClient, address, assetId);
+const userBoxExists = await this.hasUserBox(fsClient, address, assetId);
 
-        const freezeEligible = await this.isFreezeEligible(fsClient, address, assetId);
-        const isFrozen = await this.isFrozen(fsClient, address, assetId);
-        if (freezeEligible && !isFrozen) {
+if (freezeEligible && !userBoxExists) {
+
+      if (assetId === fromASAID || assetId === toASAID) {
+
           const mbrTxn = makePaymentTxnWithSuggestedParamsFromObject({
             sender: address,
             receiver: fsClient.appClient.appAddress,
@@ -269,15 +270,26 @@ public async getAssetInfo(
   }
 
   private async isFreezeEligible(fsClient: FirstStageClient, address: string, assetId: bigint): Promise<boolean> {
-    try {
-      const key = getUserAssetBoxKey(Number(assetId), address);
-      const box = await fsClient.appClient.getBoxValue(key);
-      const decoded = decodeUserDepositBox(box);
-      return (decoded as any).freeze_eligible ?? false;
-    } catch {
-      return false;
-    }
+  const exemptResult = await fsClient.checkIsAddressExempt({
+    sender: address,
+    args: [address, BigInt(assetId)]
+  });
+
+  if (exemptResult === true) {
+    return false;
   }
+
+  const maybeExemptAppResult = await fsClient.checkIsAddressMaybeExemptApp({
+    sender: address,
+    args: [address, BigInt(assetId)]
+  });
+
+  if (maybeExemptAppResult === true) {
+    return false;
+  }
+
+  return true;
+}
 
   private async isFrozen(fsClient: FirstStageClient, address: string, assetId: bigint): Promise<boolean> {
     try {
