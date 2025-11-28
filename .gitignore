@@ -13,3 +13,6 @@ build/
 
 # Environment files
 .env
+
+# Packed files
+*.tgz
