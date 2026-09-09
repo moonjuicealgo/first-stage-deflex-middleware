@@ -1,5 +1,7 @@
 import algosdk from 'algosdk';
 
+export const ZERO_ADDRESS = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ';
+
 /**
  * Construct the box key for an asset.
  * Prefix 'a' + 8-byte asset ID
@@ -34,8 +36,12 @@ export async function getExemptWalletBoxKey(
 
   if (prefix === 'r' && algodClient) {
     const info = await algodClient.accountInformation(addrStr).do();
-    const authAddr = info['authAddr'] ?? addrStr;
-    addrBytes = algosdk.decodeAddress(String(authAddr)).publicKey; // <--- cast to string
+    // The contract keys this box on the AVM's `auth_address`, which is the zero address for
+    // an account that has never been rekeyed. Falling back to the account's own address
+    // produces a box name the contract never reads, and the app call is then rejected with
+    // "invalid Box reference".
+    const authAddr = info['authAddr'] ?? ZERO_ADDRESS;
+    addrBytes = algosdk.decodeAddress(String(authAddr)).publicKey;
   }
 
   return new Uint8Array([...new TextEncoder().encode(prefix), ...addrBytes]);

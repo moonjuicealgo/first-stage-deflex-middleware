@@ -56,3 +56,19 @@ const swap = await deflex.newSwap({
 
 const result = await swap.execute()
 console.log('Swap confirmed in round', result.confirmedRound)
+```
+
+## Notes for integrators
+
+- Build the swap from a quote returned by `newQuote()`, not from a raw `fetchQuote()` response.
+  The middleware sizes the tax from the quote's original request amount, which only
+  `newQuote()` carries.
+- The middleware injects up to six transactions per First Stage asset (asset opt-in, the MBR
+  payment and freeze call that create the user box, then `general_operations_top`, the tax
+  transfer and `general_operations_bottom`). It reserves those slots by lowering
+  `maxGroupSize` on the quote request, so pass the largest `maxGroupSize` you can afford.
+- Wallets that are exempt from First Stage taxes are left alone entirely - no tax, no freeze
+  and no app calls.
+- `tests/mainnetMiddlewareTest.ts` builds the injected group against MainNet and runs it
+  through algod's simulate endpoint: `npm run test-mainnet` (set `FS_TEST_ADDRESS` to check a
+  particular wallet).

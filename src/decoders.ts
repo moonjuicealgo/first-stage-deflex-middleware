@@ -62,12 +62,14 @@ export function decodeAssetBox(bytes: Uint8Array): AssetInformation {
   const sell_tax = (flags & 0b01000000) !== 0;
   const taxes_in_algo = (flags & 0b00100000) !== 0;
 
+  // Matches the contract's tax_flow total: project + burn + reflection + freeze.
+  // liquidity_tax_bps (offset 96) is deliberately excluded - it is not part of the tax the
+  // caller has to transfer.
   const total_tax_bps =
     readUint64BE(64) + // project
     readUint64BE(72) + // burn
     readUint64BE(80) + // reflection
-    readUint64BE(88) + // freeze
-    readUint64BE(96);  // liquidity
+    readUint64BE(88);  // freeze
 
   return {
     admin_account,

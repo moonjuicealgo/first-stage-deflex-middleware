@@ -1,4 +1,4 @@
-import algosdk, { TransactionSigner, Transaction, Algodv2, makeApplicationCallTxnFromObject } from 'algosdk';
+import algosdk, { Transaction, TransactionSigner } from 'algosdk';
 import { FirstStageMiddleware } from '../src/index';
 
 // ---------- CONFIG ----------
@@ -6,113 +6,148 @@ const ALGOD_SERVER = 'https://mainnet-api.algonode.cloud';
 const ALGOD_TOKEN = '';
 const ALGOD_PORT = '';
 
-const TEST_ADDRESS = 'NOLXAGDW6KLLX3GRIVGU72HPHW7WWUN2VE7GUZOLYKEG7FGM6FENVFFEXQ';
+// Override with FS_TEST_ADDRESS to check the flow for a specific wallet. The default is a
+// public MOOJ holder that is neither exempt nor registered yet, so it exercises the full
+// path: opt-in check, user box creation (freeze) and the top/tax/bottom trio.
+const TEST_ADDRESS =
+  process.env.FS_TEST_ADDRESS ?? 'AAALMNIKYS7LY7T57ABW4SIJII66TMHXKSOO5S2MBMNMEXIWCYAYYKNMRU';
+
+const MOOJ = 2154668640n;
+const ALGO = 0n;
 
 // ---------- SETUP ----------
 const algodClient = new algosdk.Algodv2(ALGOD_TOKEN, ALGOD_SERVER, ALGOD_PORT);
-const middleware = new FirstStageMiddleware();
-
-// ---------- DUMMY SIGNER ----------
-const dummySigner: TransactionSigner = async (txns: Transaction[]) =>
-  txns.map(() => new Uint8Array());
+const dummySigner: TransactionSigner = algosdk.makeEmptyTransactionSigner();
 
 // ---------- HELPERS ----------
 function inspectTransactions(txns: { txn: Transaction }[]) {
   if (!txns || txns.length === 0) {
-    console.log('⚠️ No transactions returned');
+    console.log('  (no transactions)');
     return;
   }
 
-  console.log('\n===== Transaction Group =====');
   txns.forEach((wrapped, i) => {
     const tx = wrapped.txn;
-    console.log(`#${i + 1} Type: ${tx.type} | Fee: ${tx.fee}`);
-    console.log(`   Sender: ${algosdk.encodeAddress(tx.sender.publicKey)}`);
-    if (tx.type === 'axfer') {
-      console.log(`   AssetTransfer: ${tx.assetTransfer?.assetIndex} (${tx.assetTransfer?.amount})`);
-    }
-    if (tx.type === 'appl') {
-      const args = tx.applicationCall?.appArgs?.map(a => Buffer.from(a).toString()) ?? [];
-      console.log(`   AppCall → ID: ${tx.applicationCall?.appIndex}, Args: [${args.join(', ')}]`);
-console.log('   Box References:');
-tx.applicationCall?.boxes?.forEach((b, i) => {
-  console.log(`     #${i + 1} AppID: ${b.appIndex}, Name (hex): ${Buffer.from(b.name).toString('hex')}`);
-  console.log(`             Name (base64): ${Buffer.from(b.name).toString('base64')}`);
-});
+    const call = tx.applicationCall;
+    const refs = call
+      ? (call.accounts?.length ?? 0) +
+        (call.foreignAssets?.length ?? 0) +
+        (call.foreignApps?.length ?? 0) +
+        (call.boxes?.length ?? 0)
+      : 0;
 
+    console.log(`  #${i + 1} ${tx.type} fee=${tx.fee}`);
+    if (tx.assetTransfer) {
+      console.log(`     asset ${tx.assetTransfer.assetIndex} amount ${tx.assetTransfer.amount}`);
     }
-    console.log('----------------------------');
+    if (call) {
+      // A single transaction may reference at most 8 resources, of which at most 4 accounts.
+      console.log(
+        `     app ${call.appIndex} refs=${refs}/8 (accounts=${call.accounts?.length ?? 0}/4,` +
+          ` assets=${call.foreignAssets?.length ?? 0}, apps=${call.foreignApps?.length ?? 0},` +
+          ` boxes=${call.boxes?.length ?? 0})`
+      );
+      if (refs > 8) console.log('     ^^ EXCEEDS MaxAppTotalTxnReferences');
+      if ((call.accounts?.length ?? 0) > 4) console.log('     ^^ EXCEEDS MaxAppTxnAccounts');
+    }
   });
 }
 
-// ---------- TEST FUNCTIONS ----------
-async function testAdjustQuoteParams() {
-  const params = {
-    fromASAID: 2154668640n,
-    toASAID: 312769n,
-    amount: 1_000_000,
+/**
+ * Builds the group the middleware would inject and runs it through algod's simulate endpoint.
+ * The Deflex swap transactions are not included, so this checks exactly what the middleware
+ * owns: references, box names, fees and the tax the contract asks for.
+ */
+async function simulateGroup(txns: { txn: Transaction }[]) {
+  if (txns.length === 0) {
+    console.log('  nothing to simulate (asset is not First Stage, or the wallet is exempt)');
+    return;
+  }
+
+  const atc = new algosdk.AtomicTransactionComposer();
+  for (const t of txns) atc.addTransaction({ txn: t.txn, signer: dummySigner });
+
+  const result = await atc.simulate(
+    algodClient,
+    new algosdk.modelsv2.SimulateRequest({
+      txnGroups: [],
+      allowEmptySignatures: true,
+      fixSigners: true,
+      allowUnnamedResources: false,
+    })
+  );
+
+  const group = result.simulateResponse.txnGroups[0];
+  if (group.failureMessage) {
+    console.log(`  SIMULATE FAILED at ${group.failedAt}: ${group.failureMessage}`);
+  } else {
+    console.log('  SIMULATE OK');
+  }
+}
+
+async function runSwap(label: string, fromASAID: bigint, toASAID: bigint, amount: bigint) {
+  console.log(`\n=== ${label} ===`);
+  const middleware = new FirstStageMiddleware();
+  const suggestedParams = await algodClient.getTransactionParams().do();
+
+  const adjusted = await middleware.adjustQuoteParams({
+    fromASAID,
+    toASAID,
+    amount,
     address: TEST_ADDRESS,
     maxGroupSize: 16,
-    type: 'fixed-input' as const,
-  };
+    type: 'fixed-input',
+    algodClient,
+  } as never);
+  console.log(`  requested ${amount} -> routed ${adjusted.amount}, maxGroupSize ${adjusted.maxGroupSize}`);
 
-  const adjusted = await middleware.adjustQuoteParams(params as any);
-  console.log('Adjusted quote params:', adjusted);
-}
-
-async function testBeforeSwap() {
-  const suggestedParams = await algodClient.getTransactionParams().do();
+  // Stands in for the quote Deflex returns: `amount` is the caller's original request and
+  // `quote` is what the router says the other side of the trade is worth.
+  const quote = { amount, quote: adjusted.amount, type: 'fixed-input' };
 
   const context = {
     address: TEST_ADDRESS,
-    fromASAID: 2154668640n,
-    toASAID: 312769n,
+    fromASAID,
+    toASAID,
     algodClient,
     signer: dummySigner,
     suggestedParams,
+    quote,
   };
 
-    const fromInfo = await middleware.getAssetInfo(context.fromASAID, context.algodClient);
-  const toInfo = await middleware.getAssetInfo(context.toASAID, context.algodClient);
+  const before = await middleware.beforeSwap(context as never);
+  const after = await middleware.afterSwap(context as never);
 
-  console.log('From Asset Info:', fromInfo);
-  console.log('To Asset Info:', toInfo);
-
-  const txns = await middleware.beforeSwap(context as any);
-  console.log('Before swap txns:');
-  inspectTransactions(txns);
+  console.log(' beforeSwap:');
+  inspectTransactions(before);
+  console.log(' afterSwap:');
+  inspectTransactions(after);
+  await simulateGroup([...before, ...after]);
 }
 
-async function testAfterSwap() {
-  const suggestedParams = await algodClient.getTransactionParams().do();
-
-
-  const context = {
-    address: TEST_ADDRESS,
-    fromASAID: 2154668640n,
-    toASAID: 312769n,
-    algodClient,
-    signer: dummySigner,
-    suggestedParams,
-    quote: { amount: 100_000_000 },
-  };
-
-  const txns = await middleware.afterSwap(context as any);
-  console.log('\n After swap txns:');
-  inspectTransactions(txns);
+/** The tax transfer comes out of the wallet, so keep the test sell within what it holds. */
+async function sellableAmount(assetId: bigint): Promise<bigint> {
+  try {
+    const info = await algodClient.accountAssetInformation(TEST_ADDRESS, Number(assetId)).do();
+    const balance = BigInt(info['assetHolding']?.amount ?? 0);
+    return balance < 1_000_000_000n ? balance / 2n : 1_000_000_000n;
+  } catch {
+    return 0n;
+  }
 }
 
-// ---------- RUN ALL TESTS ----------
 async function main() {
-  console.log('--- Testing adjustQuoteParams ---');
-  await testAdjustQuoteParams();
+  console.log(`Testing against ${TEST_ADDRESS}`);
+  const middleware = new FirstStageMiddleware();
+  console.log('MOOJ asset info:', await middleware.getAssetInfo(MOOJ, algodClient));
 
-  console.log('--- Testing beforeSwap ---');
-  await testBeforeSwap();
-
-  console.log('--- Testing afterSwap ---');
-  await testAfterSwap();
+  const sellAmount = await sellableAmount(MOOJ);
+  if (sellAmount > 0n) {
+    await runSwap('sell MOOJ for ALGO', MOOJ, ALGO, sellAmount);
+  } else {
+    console.log('\n=== sell MOOJ for ALGO === skipped: test wallet holds no MOOJ');
+  }
+  await runSwap('buy MOOJ with ALGO', ALGO, MOOJ, 10_000_000n);
 }
 
 main().catch(console.error);
-
