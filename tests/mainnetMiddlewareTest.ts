@@ -7,13 +7,16 @@ const ALGOD_TOKEN = '';
 const ALGOD_PORT = '';
 
 // Override with FS_TEST_ADDRESS to check the flow for a specific wallet. The default is a
-// public MOOJ holder that is neither exempt nor registered yet, so it exercises the full
-// path: opt-in check, user box creation (freeze) and the top/tax/bottom trio.
+// public holder of both assets below, so every leg has a real balance to tax.
 const TEST_ADDRESS =
-  process.env.FS_TEST_ADDRESS ?? 'AAALMNIKYS7LY7T57ABW4SIJII66TMHXKSOO5S2MBMNMEXIWCYAYYKNMRU';
+  process.env.FS_TEST_ADDRESS ?? 'ALNUW2HFBJ4OQU4GCKUJQUORFGUWBO2ZEZ3VGUORY3GUO6PTNHSBFVXKBM';
 
-const MOOJ = 2154668640n;
+const MOOJ = 2154668640n; // 9% total tax, 8 decimals
+const DEAL = 3243618309n; // 1% total tax, 6 decimals
 const ALGO = 0n;
+
+// Override with FS_TEST_ASSET to check a single asset.
+const TEST_ASSETS = process.env.FS_TEST_ASSET ? [BigInt(process.env.FS_TEST_ASSET)] : [MOOJ, DEAL];
 
 // ---------- SETUP ----------
 const algodClient = new algosdk.Algodv2(ALGOD_TOKEN, ALGOD_SERVER, ALGOD_PORT);
@@ -139,15 +142,32 @@ async function sellableAmount(assetId: bigint): Promise<bigint> {
 async function main() {
   console.log(`Testing against ${TEST_ADDRESS}`);
   const middleware = new FirstStageMiddleware();
-  console.log('MOOJ asset info:', await middleware.getAssetInfo(MOOJ, algodClient));
 
-  const sellAmount = await sellableAmount(MOOJ);
-  if (sellAmount > 0n) {
-    await runSwap('sell MOOJ for ALGO', MOOJ, ALGO, sellAmount);
-  } else {
-    console.log('\n=== sell MOOJ for ALGO === skipped: test wallet holds no MOOJ');
+  for (const asset of TEST_ASSETS) {
+    const params = await algodClient.getAssetByID(Number(asset)).do();
+    const unit = params.params.unitName ?? String(asset);
+    const info = await middleware.getAssetInfo(asset, algodClient);
+
+    console.log(`\n########## ${unit} (${asset}) ##########`);
+    if (!info) {
+      console.log('  not a registered First Stage asset - skipping');
+      continue;
+    }
+    console.log(
+      `  total tax ${info.total_tax_bps} bps` +
+        ` (project ${info.project_tax_bps}, burn ${info.burn_tax_bps},` +
+        ` reflection ${info.reflection_tax_bps}, freeze ${info.freeze_tax_bps})` +
+        `, buy_tax ${info.buy_tax}, sell_tax ${info.sell_tax}, taxes_in_algo ${info.taxes_in_algo}`
+    );
+
+    const sellAmount = await sellableAmount(asset);
+    if (sellAmount > 0n) {
+      await runSwap(`sell ${unit} for ALGO`, asset, ALGO, sellAmount);
+    } else {
+      console.log(`\n=== sell ${unit} for ALGO === skipped: test wallet holds no ${unit}`);
+    }
+    await runSwap(`buy ${unit} with ALGO`, ALGO, asset, 10_000_000n);
   }
-  await runSwap('buy MOOJ with ALGO', ALGO, MOOJ, 10_000_000n);
 }
 
 main().catch(console.error);
