@@ -9,14 +9,14 @@ import type {
   FetchQuoteParams,
   QuoteType,
 } from '@txnlab/deflex';
-import { FirstStageClient } from './FirstStageClientMinimal';
+import { FirstStageClient } from './FirstStageClientMinimal.js';
 import {
   getBoxKeyForAsset,
   getUserAssetBoxKey,
   getExemptWalletBoxKey,
   ZERO_ADDRESS,
-} from './boxes';
-import { decodeAssetBox, type AssetInformation } from './decoders';
+} from './boxes.js';
+import { decodeAssetBox, type AssetInformation } from './decoders.js';
 import { AlgoAmount } from '@algorandfoundation/algokit-utils/types/amount';
 import { AlgorandClient } from '@algorandfoundation/algokit-utils';
 

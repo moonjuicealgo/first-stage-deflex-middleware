@@ -1,6 +1,11 @@
 {
+  // The source uses explicit .js specifiers so the ESM build is valid Node ESM; this lets
+  // ts-node resolve them back to the .ts files when the tests run from source.
+  "ts-node": {
+    "experimentalResolver": true
+  },
   "compilerOptions": {
-    "outDir": "dist",
+    "outDir": "dist/cjs",
     "rootDir": "src",
     "declaration": true,
     "sourceMap": true,

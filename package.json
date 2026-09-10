@@ -1,13 +1,32 @@
 {
   "name": "first-stage-deflex-middleware",
-  "version": "1.0.2",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "version": "1.0.3",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/cjs/index.d.ts",
   "type": "commonjs",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENCE.md"
+  ],
   "scripts": {
     "test-mainnet": "node -r ts-node/register tests/mainnetMiddlewareTest.ts",
     "test-testnet": "node -r ts-node/register tests/testnetBuyTaxTest.ts",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/finish-build.mjs"
   },
   "dependencies": {
     "@algorandfoundation/algokit-utils": "^9.1.2"
