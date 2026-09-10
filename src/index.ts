@@ -21,9 +21,6 @@ import { AlgoAmount } from '@algorandfoundation/algokit-utils/types/amount';
 import { AlgorandClient } from '@algorandfoundation/algokit-utils';
 
 const FIRST_STAGE_MAINNET_APP_ID = 3158291365;
-const TM_APP_ID = 1002541853n;
-const BONFIRE_WALLET = 'BNFIREKGRXEHCFOEQLTX3PU5SUCMRKDU7WHNBGZA4SXPW42OAHZBP7BPHY';
-const DEPLOYER_WALLET = 'FJHGNHTMRSQCISPDN2N6FTFKXM64S2X52M6BYONH7ZMON3SPRUZTSAHV54';
 const DEFAULT_ALGOD_SERVER = 'https://mainnet-api.algonode.cloud';
 
 /** MBR for the 40-byte key / 48-byte value user_asset_info box the freeze call creates. */
@@ -70,6 +67,24 @@ interface AssetPlan {
   userBoxExists: boolean;
 }
 
+/**
+ * The accounts and application general_operations_bottom pays out to. Read from the app's
+ * global state rather than hardcoded, so the same middleware works against a TestNet
+ * deployment (different burn wallet, different Tinyman app) as against MainNet.
+ */
+interface AppConfig {
+  burnWallet: string;
+  admin: string;
+  poolAppId: bigint;
+}
+
+export interface FirstStageMiddlewareOptions {
+  /** First Stage referral address, which collects a share of the tax volume. */
+  referralAddress?: string;
+  /** FirstStage application to talk to. Defaults to the MainNet deployment. */
+  appId?: bigint | number;
+}
+
 export class FirstStageMiddleware implements SwapMiddleware {
   readonly name = 'FirstStageDeflex';
   readonly version = '1.0.2';
@@ -81,10 +96,12 @@ export class FirstStageMiddleware implements SwapMiddleware {
   private fsClientAlgod?: algosdk.Algodv2;
   private readonly assetInfoCache = new Map<string, CacheEntry<AssetInformation | null>>();
   private readonly planCache = new Map<string, CacheEntry<AssetPlan>>();
+  private readonly appConfigCache = new Map<string, CacheEntry<AppConfig>>();
 
-  constructor(fsReferralAddress?: string) {
-    this.appId = BigInt(FIRST_STAGE_MAINNET_APP_ID);
-    this.fsReferralAddress = fsReferralAddress;
+  constructor(config?: string | FirstStageMiddlewareOptions) {
+    const options = typeof config === 'string' ? { referralAddress: config } : (config ?? {});
+    this.appId = BigInt(options.appId ?? FIRST_STAGE_MAINNET_APP_ID);
+    this.fsReferralAddress = options.referralAddress;
   }
 
   /**
@@ -107,6 +124,30 @@ export class FirstStageMiddleware implements SwapMiddleware {
       this.fsClientAlgod = algodClient;
     }
     return this.fsClient;
+  }
+
+  private getAppConfig(algod: algosdk.Algodv2): Promise<AppConfig> {
+    return this.memo(this.appConfigCache, this.appId.toString(), async () => {
+      const app = await algod.getApplicationByID(this.appId).do();
+      const state = app.params.globalState ?? [];
+
+      const toBytes = (value: unknown): Uint8Array =>
+        typeof value === 'string' ? Buffer.from(value, 'base64') : (value as Uint8Array);
+      const find = (name: string) =>
+        state.find((kv) => Buffer.from(toBytes(kv.key)).toString('utf-8') === name)?.value;
+
+      const address = (name: string): string => {
+        const raw = find(name)?.bytes;
+        if (!raw) throw new Error(`FirstStage app ${this.appId} has no ${name} in global state`);
+        return algosdk.encodeAddress(toBytes(raw));
+      };
+
+      return {
+        burnWallet: address('global_burn_wallet'),
+        admin: address('global_admin'),
+        poolAppId: BigInt(find('pool_app_id')?.uint ?? 0),
+      };
+    });
   }
 
   private async getBoxReferences(
@@ -215,6 +256,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
       if (!plan.info || plan.exempt) continue;
 
       const boxes = await this.getBoxReferences(address, assetId, algod);
+      const appConfig = await this.getAppConfig(algod);
       const validity = {
         firstValidRound: BigInt(suggestedParams.firstValid),
         lastValidRound: BigInt(suggestedParams.lastValid),
@@ -256,7 +298,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
           userBalance: await this.getUserBalance(address, assetId, algod),
         },
         boxReferences: boxes,
-        accountReferences: [BONFIRE_WALLET, DEPLOYER_WALLET],
+        accountReferences: [appConfig.burnWallet, appConfig.admin],
         extraFee: AlgoAmount.MicroAlgos(1000n),
         ...validity,
       });
@@ -296,6 +338,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
       const assetParams = await algod.getAssetByID(Number(assetId)).do();
       const projectAccount = (assetParams.params.reserve ?? ZERO_ADDRESS).toString();
       const poolAccount = plan.info.main_pool || ZERO_ADDRESS;
+      const appConfig = await this.getAppConfig(algod);
 
       // No box references here: the top call already made them available to the group. The
       // accounts below plus the referral (an ABI account argument) plus the asset and the
@@ -305,7 +348,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
         signer,
         args: [2n, assetId, { txn: taxTxn, signer }, referralAddress],
         accountReferences: [poolAccount, projectAccount],
-        appReferences: [TM_APP_ID],
+        appReferences: [appConfig.poolAppId],
         extraFee: AlgoAmount.MicroAlgos(11_000n),
         firstValidRound: BigInt(suggestedParams.firstValid),
         lastValidRound: BigInt(suggestedParams.lastValid),

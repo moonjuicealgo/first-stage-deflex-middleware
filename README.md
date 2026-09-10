@@ -69,6 +69,11 @@ console.log('Swap confirmed in round', result.confirmedRound)
   `maxGroupSize` on the quote request, so pass the largest `maxGroupSize` you can afford.
 - Wallets that are exempt from First Stage taxes are left alone entirely - no tax, no freeze
   and no app calls.
+- The middleware talks to the MainNet FirstStage app by default. Pass
+  `new FirstStageMiddleware({ referralAddress, appId })` to point it at another deployment;
+  the burn wallet, admin account and pool application are read from that app's global state.
 - `tests/mainnetMiddlewareTest.ts` builds the injected group against MainNet and runs it
   through algod's simulate endpoint: `npm run test-mainnet` (set `FS_TEST_ADDRESS` to check a
-  particular wallet).
+  particular wallet, `FS_TEST_ASSET` to check one asset).
+- `tests/testnetBuyTaxTest.ts` (`npm run test-testnet`) covers what MainNet cannot: an asset
+  with a buy tax and with a liquidity tax bucket.

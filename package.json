@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "test-mainnet": "node -r ts-node/register tests/mainnetMiddlewareTest.ts",
+    "test-testnet": "node -r ts-node/register tests/testnetBuyTaxTest.ts",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
