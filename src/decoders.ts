@@ -25,6 +25,16 @@ export interface AssetInformation {
   sell_tax: boolean;
   taxes_in_algo: boolean;
   total_tax_bps: bigint;
+  /**
+   * How the tax settles, from the 505-byte record of the upgraded contract (undefined on a
+   * 249-byte record): 0 and 1 swap through `main_pool` into ALGO, 2 through `tax_asset_pool`
+   * into `tax_asset_id` - a USDC-bonded launch, say.
+   */
+  tax_mode?: bigint;
+  tax_asset_id?: bigint;
+  tax_asset_pool?: string;
+  /** The tax hook a share of the tax is paid to, 0 for none (upgraded record only). */
+  hook_app_id?: bigint;
 }
 
 
@@ -99,6 +109,14 @@ export function decodeAssetBox(bytes: Uint8Array): AssetInformation {
     sell_tax,
     taxes_in_algo,
     total_tax_bps,
+    ...(bytes.length >= 425
+      ? {
+          tax_asset_id: readUint64BE(369),
+          tax_asset_pool: algosdk.encodeAddress(bytes.slice(377, 409)),
+          tax_mode: readUint64BE(417),
+          hook_app_id: readUint64BE(345),
+        }
+      : {}),
   };
 }
 

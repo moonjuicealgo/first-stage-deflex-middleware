@@ -32,6 +32,15 @@ const MIN_ASSET_BOX_LENGTH = 249;
 const TXNS_PER_FIRST_STAGE_ASSET = 3;
 /** MBR payment + freeze call, needed once per asset to create the user box. */
 const TXNS_PER_FREEZE = 2;
+/**
+ * An `increase_budget` call for an asset whose tax pays a hook: the hook's account and its
+ * bookkeeping need references and opcode budget that the top and bottom calls have no room
+ * for. Only those assets pay this slot.
+ */
+const TXNS_PER_HOOK = 1;
+
+/** Whether the upgraded contract pays a hook out of this asset's tax. */
+const paysHook = (info: AssetInformation | null): boolean => Boolean(info?.hook_app_id);
 const TXNS_PER_OPT_IN = 1;
 
 /**
@@ -47,6 +56,15 @@ interface CacheEntry<T> {
   at: number;
   value: Promise<T>;
 }
+
+const enc = new TextEncoder();
+
+/** The exact tax for one side of a transfer, as the upgraded FirstStage will charge it. */
+const QUOTE_TAX_SIDE = algosdk.ABIMethod.fromSignature('quote_tax_amount_side(asset,uint64,bool)uint64');
+
+/** A one-letter prefix and an asset id: the key of FirstStage's per-asset boxes. */
+const prefixedAssetKey = (prefix: string, assetId: bigint): Uint8Array =>
+  new Uint8Array([...enc.encode(prefix), ...algosdk.encodeUint64(assetId)]);
 
 const ceilDiv = (numerator: bigint, denominator: bigint): bigint =>
   denominator === 0n ? 0n : (numerator + denominator - 1n) / denominator;
@@ -76,6 +94,11 @@ interface AppConfig {
   burnWallet: string;
   admin: string;
   poolAppId: bigint;
+  /**
+   * The AMM adapter the upgraded FirstStage swaps its tax through, inside the trade - named
+   * by its "amm" box. 0 on a FirstStage without one, which settles nothing in the trade.
+   */
+  adapterAppId: bigint;
 }
 
 export interface FirstStageMiddlewareOptions {
@@ -97,6 +120,8 @@ export class FirstStageMiddleware implements SwapMiddleware {
   private readonly assetInfoCache = new Map<string, CacheEntry<AssetInformation | null>>();
   private readonly planCache = new Map<string, CacheEntry<AssetPlan>>();
   private readonly appConfigCache = new Map<string, CacheEntry<AppConfig>>();
+  /** Set once the app turns out to have no `quote_tax_amount_side`: the stored rates are used. */
+  private quoteUnsupported = false;
 
   constructor(config?: string | FirstStageMiddlewareOptions) {
     const options = typeof config === 'string' ? { referralAddress: config } : (config ?? {});
@@ -146,6 +171,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
         burnWallet: address('global_burn_wallet'),
         admin: address('global_admin'),
         poolAppId: BigInt(find('pool_app_id')?.uint ?? 0),
+        adapterAppId: await this.readBoxUint(algod, enc.encode('amm')),
       };
     });
   }
@@ -155,12 +181,32 @@ export class FirstStageMiddleware implements SwapMiddleware {
     assetId: bigint,
     algodClient: algosdk.Algodv2
   ): Promise<{ appId: bigint; name: Uint8Array }[]> {
-    return [
+    const boxes = [
       { appId: this.appId, name: getBoxKeyForAsset(Number(assetId)) },
       { appId: this.appId, name: getUserAssetBoxKey(Number(assetId), userAddr) },
       { appId: this.appId, name: await getExemptWalletBoxKey('g', userAddr) },
       { appId: this.appId, name: await getExemptWalletBoxKey('r', userAddr, algodClient) },
     ];
+    // The upgraded FirstStage settles the tax in the trade: it looks up its adapter ("amm")
+    // and whether the main pool is Pact ("v" + asset, absent for Tinyman). A box it only
+    // checks for still has to be named, and each name also adds 1KB to the group's box read
+    // budget, which a 505-byte record needs.
+    if ((await this.getAppConfig(algodClient)).adapterAppId) {
+      boxes.push({ appId: this.appId, name: enc.encode('amm') });
+      boxes.push({ appId: this.appId, name: prefixedAssetKey('v', assetId) });
+    }
+    return boxes;
+  }
+
+  /** A FirstStage box holding one uint64, or 0 when the box does not exist. */
+  private async readBoxUint(algod: algosdk.Algodv2, name: Uint8Array): Promise<bigint> {
+    try {
+      const res = await algod.getApplicationBoxByName(this.appId, name).do();
+      return algosdk.decodeUint64(new Uint8Array(res.value).slice(0, 8), 'bigint');
+    } catch (err: any) {
+      if (isNotFound(err)) return 0n;
+      throw err;
+    }
   }
 
   async shouldApply(context: QuoteContext): Promise<boolean> {
@@ -198,21 +244,19 @@ export class FirstStageMiddleware implements SwapMiddleware {
       // The top/tax/bottom trio is added for every registered asset, taxed or not: the asset
       // is frozen at rest, so without them the swap transfer itself cannot settle.
       reservedTxns += TXNS_PER_FIRST_STAGE_ASSET;
+      if (paysHook(plan.info)) reservedTxns += TXNS_PER_HOOK;
       if (!plan.userBoxExists) reservedTxns += TXNS_PER_FREEZE;
-
-      const bps = plan.info.total_tax_bps;
-      if (bps === 0n) continue;
 
       // fixed-input sell: the requested amount has to cover both the swap and the tax, so the
       // router is quoted on the post-tax remainder.
-      if (type === 'fixed-input' && plan.info.sell_tax && assetId === fromASAID) {
-        adjustedAmount = (adjustedAmount * (10_000n - bps)) / 10_000n;
+      if (type === 'fixed-input' && assetId === fromASAID) {
+        adjustedAmount -= await this.taxOn(params.address, plan.info, assetId, adjustedAmount, false, algod);
       }
 
       // fixed-output buy: the tax comes out of what the router delivers, so ask for enough
       // extra that the user is left with the amount they requested.
-      if (type === 'fixed-output' && plan.info.buy_tax && assetId === toASAID) {
-        adjustedAmount = ceilDiv(adjustedAmount * (10_000n + bps), 10_000n);
+      if (type === 'fixed-output' && assetId === toASAID) {
+        adjustedAmount += await this.taxOnTop(params.address, plan.info, assetId, adjustedAmount, true, algod);
       }
     }
 
@@ -278,7 +322,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
             refreezeAddress: address,
             mbr: { txn: mbrTxn, signer },
           },
-          boxReferences: boxes,
+          // Freezing also checks the asset's hook-protection box ("p" + asset), so the hook
+          // the tax pays cannot be frozen: 7 boxes and the asset, 8 of 8.
+          boxReferences: appConfig.adapterAppId ? [...boxes, { appId: this.appId, name: prefixedAssetKey('p', assetId) }] : boxes,
           extraFee: AlgoAmount.MicroAlgos(2000n),
           ...validity,
         });
@@ -298,12 +344,31 @@ export class FirstStageMiddleware implements SwapMiddleware {
           userBalance: await this.getUserBalance(address, assetId, algod),
         },
         boxReferences: boxes,
-        accountReferences: [appConfig.burnWallet, appConfig.admin],
+        // The upgraded FirstStage no longer pays the admin inside a trade, and the two settlement
+        // boxes above take the slot it used: 6 boxes, the asset and the burn wallet are 8 of 8.
+        accountReferences: appConfig.adapterAppId ? [appConfig.burnWallet] : [appConfig.burnWallet, appConfig.admin],
         extraFee: AlgoAmount.MicroAlgos(1000n),
         ...validity,
       });
 
       for (const t of topTx.transactions) txns.push({ txn: t, signer });
+
+      if (paysHook(plan.info)) {
+        const hookAccount = algosdk.getApplicationAddress(plan.info.hook_app_id!).toString();
+        const padTx = await fsClient.createTransaction.increaseBudget({
+          sender: address,
+          signer,
+          args: [],
+          accountReferences: [hookAccount],
+          assetReferences: [assetId],
+          appReferences: [plan.info.hook_app_id!],
+          // The hook's event log ("e" + asset), which the bottom call appends this trade to.
+          boxReferences: [{ appId: this.appId, name: prefixedAssetKey('e', assetId) }],
+          note: enc.encode(`fs-hook-${assetId}`),
+          ...validity,
+        });
+        for (const t of padTx.transactions) txns.push({ txn: t, signer });
+      }
     }
 
     return txns;
@@ -331,7 +396,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
         sender: address,
         receiver: fsClient.appClient.appAddress,
         assetIndex: Number(assetId),
-        amount: this.calculateTax(plan.info, side, quote),
+        amount: await this.calculateTax(address, assetId, plan.info, side, quote, algod),
         suggestedParams,
       });
 
@@ -341,15 +406,25 @@ export class FirstStageMiddleware implements SwapMiddleware {
       const appConfig = await this.getAppConfig(algod);
 
       // No box references here: the top call already made them available to the group. The
-      // accounts below plus the referral (an ABI account argument) plus the asset and the
-      // Tinyman app already put this call at 5 of its 8 reference slots.
+      // pool, the project account, the referral (an ABI account argument), the asset and the
+      // pool's app take 5 of this call's 8 reference slots. The upgraded FirstStage swaps the
+      // tax through its AMM adapter inside this call, which takes the other three: the
+      // adapter, the adapter's own account (it holds the token), and ALGO, which a Pact pool's
+      // swap lists and an inner call can only name if the group already has.
+      const settles = appConfig.adapterAppId !== 0n;
+      const pactApp = settles ? await this.readBoxUint(algod, prefixedAssetKey('v', assetId)) : 0n;
       const bottomTx = await fsClient.createTransaction.generalOperationsBottom({
         sender: address,
         signer,
         args: [2n, assetId, { txn: taxTxn, signer }, referralAddress],
-        accountReferences: [poolAccount, projectAccount],
-        appReferences: [appConfig.poolAppId],
-        extraFee: AlgoAmount.MicroAlgos(11_000n),
+        accountReferences: settles
+          ? [poolAccount, projectAccount, algosdk.getApplicationAddress(appConfig.adapterAppId).toString()]
+          : [poolAccount, projectAccount],
+        appReferences: settles ? [pactApp || appConfig.poolAppId, appConfig.adapterAppId] : [appConfig.poolAppId],
+        assetReferences: settles ? [0n] : undefined,
+        // Settling in the trade runs the adapter's swap as inner transactions, each paid for
+        // here: up to two hops, plus the payouts that follow.
+        extraFee: AlgoAmount.MicroAlgos(settles ? 24_000n : 11_000n),
         firstValidRound: BigInt(suggestedParams.firstValid),
         lastValidRound: BigInt(suggestedParams.lastValid),
       });
@@ -361,17 +436,22 @@ export class FirstStageMiddleware implements SwapMiddleware {
   }
 
   /**
-   * The contract charges tax on how much of the asset the wallet gained or lost across the
-   * group, measured after the tax transfer itself has settled. Overpayment is refunded by the
-   * contract, underpayment fails the group with "Insufficient tax payment".
+   * The tax to transfer for one side of the swap.
+   *
+   * The contract taxes a sell on everything that left the wallet, the tax transfer included,
+   * and a buy on everything that arrived. Underpayment fails the group with "Insufficient tax
+   * payment"; overpayment is refunded.
    */
-  private calculateTax(info: AssetInformation, side: Side, quote: SwapContext['quote']): bigint {
-    const bps = info.total_tax_bps;
-    if (bps === 0n) return 0n;
-    if (side === 'from' ? !info.sell_tax : !info.buy_tax) return 0n;
-
+  private async calculateTax(
+    address: string,
+    assetId: bigint,
+    info: AssetInformation,
+    side: Side,
+    quote: SwapContext['quote'],
+    algod: algosdk.Algodv2
+  ): Promise<bigint> {
     const isFixedOutput = quote?.type === 'fixed-output';
-    // `amount` is the caller's original request, before adjustQuoteParams reduced it; `quote`
+    // `amount` is the caller's original request, before adjustQuoteParams changed it; `quote`
     // is the other end of the trade, which the router computed from the adjusted amount.
     const requested = BigInt(quote?.amount ?? 0);
     const routed = BigInt(quote?.quote ?? 0);
@@ -380,19 +460,106 @@ export class FirstStageMiddleware implements SwapMiddleware {
       if (isFixedOutput) {
         // The router needs `routed` units of input; the tax is charged on top of that.
         this.assertQuoted(routed);
-        return ceilDiv(routed * bps, 10_000n - bps);
+        return this.taxOnTop(address, info, assetId, routed, false, algod);
       }
       // The router was quoted on requested - tax, so the wallet's total outflow is `requested`.
       this.assertQuoted(requested);
-      return ceilDiv(requested * bps, 10_000n);
+      return this.taxOn(address, info, assetId, requested, false, algod);
     }
 
-    // Buy side: the wallet gains (received - tax), so charging the full rate on the gross
-    // received slightly overpays and the contract refunds the difference. That also absorbs
-    // the router delivering a little more than it quoted.
-    const received = isFixedOutput ? ceilDiv(requested * (10_000n + bps), 10_000n) : routed;
-    this.assertQuoted(received);
-    return ceilDiv(received * bps, 10_000n);
+    // Buy side: taxed on what arrives. On a fixed-output buy that is what the user asked for
+    // plus the tax itself, which adjustQuoteParams asked the router for.
+    if (isFixedOutput) {
+      this.assertQuoted(requested);
+      return this.taxOnTop(address, info, assetId, requested, true, algod);
+    }
+    this.assertQuoted(routed);
+    return this.taxOn(address, info, assetId, routed, true, algod);
+  }
+
+  /** The tax on `amount` moved: the contract's own quote, or the stored rates where it has none. */
+  private async taxOn(
+    address: string,
+    info: AssetInformation,
+    assetId: bigint,
+    amount: bigint,
+    isBuy: boolean,
+    algod: algosdk.Algodv2
+  ): Promise<bigint> {
+    if (amount === 0n) return 0n;
+    const quoted = await this.quoteTax(address, assetId, amount, isBuy, algod);
+    if (quoted !== null) return quoted;
+    const bps = (isBuy ? info.buy_tax : info.sell_tax) ? info.total_tax_bps : 0n;
+    return ceilDiv(amount * bps, 10_000n);
+  }
+
+  /**
+   * The tax when it is itself part of what is taxed: `net` moves and the tax moves with it, so
+   * the base is net + tax. Converges in a step or two; the last unit is rounded up, since an
+   * overpayment is refunded and an underpayment fails.
+   */
+  private async taxOnTop(
+    address: string,
+    info: AssetInformation,
+    assetId: bigint,
+    net: bigint,
+    isBuy: boolean,
+    algod: algosdk.Algodv2
+  ): Promise<bigint> {
+    let tax = await this.taxOn(address, info, assetId, net, isBuy, algod);
+    for (let i = 0; i < 4; i++) {
+      const next = await this.taxOn(address, info, assetId, net + tax, isBuy, algod);
+      if (next <= tax) break;
+      tax = next;
+    }
+    return tax === 0n ? 0n : tax + 1n;
+  }
+
+  /**
+   * The contract's `quote_tax_amount_side`, by simulation: the side's own rates, any hook's
+   * share, and a dynamic rate at this size of trade - none of which the stored rates show.
+   * Null on a FirstStage that predates the method, remembered so it is asked only once.
+   */
+  private async quoteTax(
+    address: string,
+    assetId: bigint,
+    amount: bigint,
+    isBuy: boolean,
+    algod: algosdk.Algodv2
+  ): Promise<bigint | null> {
+    if (this.quoteUnsupported) return null;
+    try {
+      const atc = new algosdk.AtomicTransactionComposer();
+      atc.addMethodCall({
+        appID: this.appId,
+        method: QUOTE_TAX_SIDE,
+        methodArgs: [assetId, amount, isBuy],
+        sender: address,
+        signer: algosdk.makeEmptyTransactionSigner(),
+        suggestedParams: await algod.getTransactionParams().do(),
+      });
+      const res = await atc.simulate(
+        algod,
+        new algosdk.modelsv2.SimulateRequest({
+          txnGroups: [],
+          allowEmptySignatures: true,
+          allowUnnamedResources: true,
+        })
+      );
+      const failure = res.simulateResponse.txnGroups[0]?.failureMessage;
+      if (failure) throw new Error(failure);
+      const result = res.methodResults[0];
+      if (result?.decodeError || result?.returnValue === undefined) throw new Error('no return value');
+      return BigInt(result.returnValue as bigint);
+    } catch (err: any) {
+      // A contract without the method rejects the call outright (its router has no match);
+      // anything else is a real failure and should not be papered over with the stored rates.
+      if (/rejected by ApprovalProgram|err opcode/i.test(String(err?.message))) {
+        this.quoteUnsupported = true;
+        return null;
+      }
+      throw err;
+    }
   }
 
   private assertQuoted(amount: bigint): void {
@@ -465,17 +632,14 @@ export class FirstStageMiddleware implements SwapMiddleware {
     address: string,
     assetId: bigint
   ): Promise<boolean> {
+    // Only the definite answer. `check_is_address_maybe_exempt_app` answers false on every
+    // contract this version supports, and a FirstStage built between 2026-10-08 and the
+    // MainNet upgrade does not have it at all.
     const exempt = await fsClient.checkIsAddressExempt({
       sender: address,
       args: [address, assetId],
     });
-    if (exempt === true) return true;
-
-    const exemptApp = await fsClient.checkIsAddressMaybeExemptApp({
-      sender: address,
-      args: [address, assetId],
-    });
-    return exemptApp === true;
+    return exempt === true;
   }
 
   private async isOptedIn(
