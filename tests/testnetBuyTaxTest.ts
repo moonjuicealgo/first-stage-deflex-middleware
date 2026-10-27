@@ -50,7 +50,7 @@ async function simulate(txns: Transaction[]) {
       allowEmptySignatures: true,
       fixSigners: true,
       allowUnnamedResources: false,
-    })
+    }),
   );
 
   const group = res.simulateResponse.txnGroups[0];
@@ -63,7 +63,9 @@ async function simulate(txns: Transaction[]) {
   // middleware's arithmetic is from the contract's.
   const refunds = group.txnResults
     .flatMap((r) => r.txnResult.innerTxns ?? [])
-    .filter((inner) => inner.txn.txn.type === 'axfer' && inner.txn.txn.assetTransfer?.receiver.toString() === USER)
+    .filter(
+      (inner) => inner.txn.txn.type === 'axfer' && inner.txn.txn.assetTransfer?.receiver.toString() === USER,
+    )
     .map((inner) => inner.txn.txn.assetTransfer?.amount ?? 0n);
 
   console.log(`  SIMULATE OK${refunds.length ? ` (tax refunded to user: ${refunds.join(', ')})` : ''}`);
@@ -142,7 +144,7 @@ async function main() {
   console.log(
     `  total tax ${info?.total_tax_bps} bps (project ${info?.project_tax_bps},` +
       ` burn ${info?.burn_tax_bps}, reflection ${info?.reflection_tax_bps},` +
-      ` freeze ${info?.freeze_tax_bps}, liquidity ${info?.liquidity_tax_bps})`
+      ` freeze ${info?.freeze_tax_bps}, liquidity ${info?.liquidity_tax_bps})`,
   );
   console.log(`  buy_tax ${info?.buy_tax}, sell_tax ${info?.sell_tax}`);
   console.log(`  user holds ${await balanceOf(USER)}, whale holds ${await balanceOf(WHALE)}`);

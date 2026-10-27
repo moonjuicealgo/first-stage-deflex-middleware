@@ -29,7 +29,7 @@ export function getUserAssetBoxKey(assetId: number, address: string): Uint8Array
 export async function getExemptWalletBoxKey(
   prefix: 'g' | 'r',
   address: string | algosdk.Address,
-  algodClient?: algosdk.Algodv2
+  algodClient?: algosdk.Algodv2,
 ): Promise<Uint8Array> {
   const addrStr = typeof address === 'string' ? address : address.toString();
   let addrBytes = algosdk.decodeAddress(addrStr).publicKey;

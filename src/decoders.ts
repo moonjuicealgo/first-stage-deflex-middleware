@@ -1,4 +1,4 @@
-import algosdk from "algosdk";
+import algosdk from 'algosdk';
 
 export interface AssetInformation {
   admin_account: string;
@@ -36,7 +36,6 @@ export interface AssetInformation {
   /** The tax hook a share of the tax is paid to, 0 for none (upgraded record only). */
   hook_app_id?: bigint;
 }
-
 
 export interface UserAssetInfo {
   pending_reflections_tokens: bigint;
@@ -82,7 +81,7 @@ export function decodeAssetBox(bytes: Uint8Array): AssetInformation {
     readUint64BE(72) + // burn
     readUint64BE(80) + // reflection
     readUint64BE(88) + // freeze
-    readUint64BE(96);  // liquidity
+    readUint64BE(96); // liquidity
 
   return {
     admin_account,
@@ -122,7 +121,7 @@ export function decodeAssetBox(bytes: Uint8Array): AssetInformation {
 
 export function decodeUserDepositBox(bytes: Uint8Array): UserDepositInfo {
   if (bytes.length < 48) {
-    throw new Error("UserDeposit box too short, expected at least 48 bytes");
+    throw new Error('UserDeposit box too short, expected at least 48 bytes');
   }
 
   const view = new DataView(bytes.buffer);
@@ -139,6 +138,6 @@ export function decodeUserDepositBox(bytes: Uint8Array): UserDepositInfo {
     locked_lp_tokens: readUint64BE(16),
     lp_app_id: readUint64BE(24),
     second_locked_asset_id: readUint64BE(32),
-    second_lp_deposit: readUint64BE(40)
+    second_lp_deposit: readUint64BE(40),
   };
 }

@@ -48,7 +48,7 @@ function inspectTransactions(txns: { txn: Transaction }[]) {
       console.log(
         `     app ${call.appIndex} refs=${refs}/8 (accounts=${call.accounts?.length ?? 0}/4,` +
           ` assets=${call.foreignAssets?.length ?? 0}, apps=${call.foreignApps?.length ?? 0},` +
-          ` boxes=${call.boxes?.length ?? 0})`
+          ` boxes=${call.boxes?.length ?? 0})`,
       );
       if (refs > 8) console.log('     ^^ EXCEEDS MaxAppTotalTxnReferences');
       if ((call.accounts?.length ?? 0) > 4) console.log('     ^^ EXCEEDS MaxAppTxnAccounts');
@@ -77,7 +77,7 @@ async function simulateGroup(txns: { txn: Transaction }[]) {
       allowEmptySignatures: true,
       fixSigners: true,
       allowUnnamedResources: false,
-    })
+    }),
   );
 
   const group = result.simulateResponse.txnGroups[0];
@@ -157,7 +157,7 @@ async function main() {
       `  total tax ${info.total_tax_bps} bps` +
         ` (project ${info.project_tax_bps}, burn ${info.burn_tax_bps},` +
         ` reflection ${info.reflection_tax_bps}, freeze ${info.freeze_tax_bps})` +
-        `, buy_tax ${info.buy_tax}, sell_tax ${info.sell_tax}, taxes_in_algo ${info.taxes_in_algo}`
+        `, buy_tax ${info.buy_tax}, sell_tax ${info.sell_tax}, taxes_in_algo ${info.taxes_in_algo}`,
     );
 
     const sellAmount = await sellableAmount(asset);

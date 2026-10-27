@@ -52,7 +52,11 @@ async function poolState(): Promise<{ token: bigint; algo: bigint; feeBps: bigin
     const get = (k: string) => BigInt(kv.find((e) => Buffer.from(e.key).toString() === k)?.value.uint ?? 0);
     // Pact orders its pair with the smaller asset id as A.
     const tokenIsA = ASSET < PAIR;
-    return { token: get(tokenIsA ? 'A' : 'B'), algo: get(tokenIsA ? 'B' : 'A'), feeBps: get('FEE_BPS') || 30n };
+    return {
+      token: get(tokenIsA ? 'A' : 'B'),
+      algo: get(tokenIsA ? 'B' : 'A'),
+      feeBps: get('FEE_BPS') || 30n,
+    };
   }
   const info = await algod.accountApplicationInformation(POOL, Number(TINYMAN_VALIDATOR)).do();
   const kv = info.appLocalState?.keyValue ?? [];
@@ -80,7 +84,12 @@ function routerTxns(sp: algosdk.SuggestedParams, buying: boolean, amountIn: bigi
   const inAsset = buying ? PAIR : ASSET;
   const input =
     inAsset === 0n
-      ? algosdk.makePaymentTxnWithSuggestedParamsFromObject({ sender: USER, receiver: POOL, amount: amountIn, suggestedParams: sp })
+      ? algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+          sender: USER,
+          receiver: POOL,
+          amount: amountIn,
+          suggestedParams: sp,
+        })
       : algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
           sender: USER,
           receiver: POOL,
@@ -123,7 +132,7 @@ async function simulate(txns: Transaction[], allowUnnamed: boolean) {
       fixSigners: true,
       allowUnnamedResources: allowUnnamed,
       allowMoreLogging: true,
-    })
+    }),
   );
   return res.simulateResponse.txnGroups[0];
 }
@@ -151,7 +160,9 @@ async function run(label: string, buying: boolean, amountIn: bigint): Promise<bo
   } as never);
   const routedIn = buying ? amountIn : BigInt(adjusted.amount);
   const routedOut = buying ? out : swapOut(routedIn, token, algo, feeBps);
-  console.log(`  requested ${requested}, routed in ${routedIn}, out ${routedOut}; maxGroupSize 16 -> ${adjusted.maxGroupSize}`);
+  console.log(
+    `  requested ${requested}, routed in ${routedIn}, out ${routedOut}; maxGroupSize 16 -> ${adjusted.maxGroupSize}`,
+  );
 
   const context = {
     address: USER,
@@ -166,7 +177,9 @@ async function run(label: string, buying: boolean, amountIn: bigint): Promise<bo
   const after = await middleware.afterSwap(context as never);
   const router = routerTxns(sp, buying, routedIn);
   const group = [...before.map((t) => t.txn), ...router, ...after.map((t) => t.txn)];
-  console.log(`  ${before.length + after.length} middleware transactions + ${router.length} router = ${group.length}`);
+  console.log(
+    `  ${before.length + after.length} middleware transactions + ${router.length} router = ${group.length}`,
+  );
 
   const strict = await simulate(group, false);
   if (!strict.failureMessage) {
@@ -189,12 +202,22 @@ async function run(label: string, buying: boolean, amountIn: bigint): Promise<bo
   }
   console.log(`  strict simulate FAILED at ${strict.failedAt}: ${strict.failureMessage.slice(0, 220)}`);
   const loose = await simulate(group, true);
-  console.log(`  with unnamed resources: ${loose.failureMessage ? `FAILED: ${loose.failureMessage.slice(0, 220)}` : 'OK'}`);
+  console.log(
+    `  with unnamed resources: ${loose.failureMessage ? `FAILED: ${loose.failureMessage.slice(0, 220)}` : 'OK'}`,
+  );
   const unnamed = loose.unnamedResourcesAccessed;
-  if (unnamed) console.log('  group needs, unnamed:', JSON.stringify(unnamed, (_, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 900));
+  if (unnamed)
+    console.log(
+      '  group needs, unnamed:',
+      JSON.stringify(unnamed, (_, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 900),
+    );
   loose.txnResults.forEach((r, i) => {
     const u = r.unnamedResourcesAccessed;
-    if (u) console.log(`  txn ${i} needs, unnamed:`, JSON.stringify(u, (_, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 600));
+    if (u)
+      console.log(
+        `  txn ${i} needs, unnamed:`,
+        JSON.stringify(u, (_, v) => (typeof v === 'bigint' ? v.toString() : v)).slice(0, 600),
+      );
   });
   const used = loose.appBudgetConsumed;
   const added = loose.appBudgetAdded;
@@ -203,9 +226,15 @@ async function run(label: string, buying: boolean, amountIn: bigint): Promise<bo
 }
 
 async function main() {
-  console.log(`FirstStage ${APP_ID} at ${ALGOD_SERVER}, asset ${ASSET} paired with ${PAIR}, ${DEX} pool ${POOL.slice(0, 8)}..., wallet ${USER.slice(0, 8)}...`);
-  const buyOk = SIDES.includes('buy') ? await run(`buy ${BUY_IN} base units of ${PAIR || 'ALGO'} worth`, true, BUY_IN) : true;
-  const sellOk = SIDES.includes('sell') ? await run(`sell ${SELL_IN} base units of the token`, false, SELL_IN) : true;
+  console.log(
+    `FirstStage ${APP_ID} at ${ALGOD_SERVER}, asset ${ASSET} paired with ${PAIR}, ${DEX} pool ${POOL.slice(0, 8)}..., wallet ${USER.slice(0, 8)}...`,
+  );
+  const buyOk = SIDES.includes('buy')
+    ? await run(`buy ${BUY_IN} base units of ${PAIR || 'ALGO'} worth`, true, BUY_IN)
+    : true;
+  const sellOk = SIDES.includes('sell')
+    ? await run(`sell ${SELL_IN} base units of the token`, false, SELL_IN)
+    : true;
   console.log(`\nbuy ${buyOk ? 'PASS' : 'FAIL'}, sell ${sellOk ? 'PASS' : 'FAIL'}`);
   process.exitCode = buyOk && sellOk ? 0 : 1;
 }

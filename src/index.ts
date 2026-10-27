@@ -1,21 +1,7 @@
-import algosdk, {
-  TransactionWithSigner,
-  makePaymentTxnWithSuggestedParamsFromObject,
-} from 'algosdk';
-import type {
-  SwapMiddleware,
-  SwapContext,
-  QuoteContext,
-  FetchQuoteParams,
-  QuoteType,
-} from '@txnlab/deflex';
+import algosdk, { TransactionWithSigner, makePaymentTxnWithSuggestedParamsFromObject } from 'algosdk';
+import type { SwapMiddleware, SwapContext, QuoteContext, FetchQuoteParams, QuoteType } from '@txnlab/deflex';
 import { FirstStageClient } from './FirstStageClientMinimal.js';
-import {
-  getBoxKeyForAsset,
-  getUserAssetBoxKey,
-  getExemptWalletBoxKey,
-  ZERO_ADDRESS,
-} from './boxes.js';
+import { getBoxKeyForAsset, getUserAssetBoxKey, getExemptWalletBoxKey, ZERO_ADDRESS } from './boxes.js';
 import { decodeAssetBox, type AssetInformation } from './decoders.js';
 import { AlgoAmount } from '@algorandfoundation/algokit-utils/types/amount';
 import { AlgorandClient } from '@algorandfoundation/algokit-utils';
@@ -194,7 +180,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
   private async getBoxReferences(
     userAddr: string,
     assetId: bigint,
-    algodClient: algosdk.Algodv2
+    algodClient: algosdk.Algodv2,
   ): Promise<{ appId: bigint; name: Uint8Array }[]> {
     const boxes = [
       { appId: this.appId, name: getBoxKeyForAsset(Number(assetId)) },
@@ -224,8 +210,14 @@ export class FirstStageMiddleware implements SwapMiddleware {
     info: AssetInformation,
     assetId: bigint,
     algod: algosdk.Algodv2,
-    tinymanApp: bigint
-  ): Promise<{ taxAsset: bigint; taxPool: string; taxPoolApp: bigint; routePool?: string; routeApp?: bigint }> {
+    tinymanApp: bigint,
+  ): Promise<{
+    taxAsset: bigint;
+    taxPool: string;
+    taxPoolApp: bigint;
+    routePool?: string;
+    routeApp?: bigint;
+  }> {
     const taxAsset = info.tax_asset_id ?? 0n;
     const taxPoolApp = (await this.readBoxUint(algod, prefixedAssetKey('x', assetId))) || tinymanApp;
     const { adapterAppId } = await this.getAppConfig(algod);
@@ -248,7 +240,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
     if (!adapter) return 0n;
     const app = await algod.getApplicationByID(adapter).do();
     const entry = (app.params.globalState ?? []).find(
-      (kv) => Buffer.from(typeof kv.key === 'string' ? Buffer.from(kv.key, 'base64') : kv.key).toString() === 'pact_factory_id'
+      (kv) =>
+        Buffer.from(typeof kv.key === 'string' ? Buffer.from(kv.key, 'base64') : kv.key).toString() ===
+        'pact_factory_id',
     );
     return BigInt(entry?.value.uint ?? 0);
   }
@@ -276,7 +270,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     params: FetchQuoteParams & {
       address?: string | null;
       algodClient?: algosdk.Algodv2;
-    }
+    },
   ): Promise<FetchQuoteParams> {
     if (!params.address) throw new Error('Address required for FirstStageMiddleware');
 
@@ -311,7 +305,14 @@ export class FirstStageMiddleware implements SwapMiddleware {
       // fixed-output buy: the tax comes out of what the router delivers, so ask for enough
       // extra that the user is left with the amount they requested.
       if (type === 'fixed-output' && assetId === toASAID) {
-        adjustedAmount += await this.taxOnTop(params.address, plan.info, assetId, adjustedAmount, true, algod);
+        adjustedAmount += await this.taxOnTop(
+          params.address,
+          plan.info,
+          assetId,
+          adjustedAmount,
+          true,
+          algod,
+        );
       }
     }
 
@@ -379,7 +380,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
           },
           // Freezing also checks the asset's hook-protection box ("p" + asset), so the hook
           // the tax pays cannot be frozen: 7 boxes and the asset, 8 of 8.
-          boxReferences: appConfig.adapterAppId ? [...boxes, { appId: this.appId, name: prefixedAssetKey('p', assetId) }] : boxes,
+          boxReferences: appConfig.adapterAppId
+            ? [...boxes, { appId: this.appId, name: prefixedAssetKey('p', assetId) }]
+            : boxes,
           extraFee: AlgoAmount.MicroAlgos(2000n),
           ...validity,
         });
@@ -401,7 +404,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
         boxReferences: boxes,
         // The upgraded FirstStage no longer pays the admin inside a trade, and the two settlement
         // boxes above take the slot it used: 6 boxes, the asset and the burn wallet are 8 of 8.
-        accountReferences: appConfig.adapterAppId ? [appConfig.burnWallet] : [appConfig.burnWallet, appConfig.admin],
+        accountReferences: appConfig.adapterAppId
+          ? [appConfig.burnWallet]
+          : [appConfig.burnWallet, appConfig.admin],
         extraFee: AlgoAmount.MicroAlgos(1000n),
         ...validity,
       });
@@ -513,7 +518,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
         accountReferences: settles
           ? [poolAccount, projectAccount, algosdk.getApplicationAddress(appConfig.adapterAppId).toString()]
           : [poolAccount, projectAccount],
-        appReferences: settles ? [pactApp || appConfig.poolAppId, appConfig.adapterAppId] : [appConfig.poolAppId],
+        appReferences: settles
+          ? [pactApp || appConfig.poolAppId, appConfig.adapterAppId]
+          : [appConfig.poolAppId],
         assetReferences: settles ? [0n] : undefined,
         // Settling in the trade runs the adapter's swap as inner transactions, each paid for
         // here: up to two hops, plus the payouts that follow.
@@ -538,7 +545,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
   async swapTax(
     quote: NonNullable<SwapContext['quote']>,
     address: string,
-    algodClient?: algosdk.Algodv2
+    algodClient?: algosdk.Algodv2,
   ): Promise<{ from: bigint; to: bigint }> {
     const algod = this.resolveAlgod(algodClient);
     const side = async (assetId: bigint, s: Side): Promise<bigint> => {
@@ -567,7 +574,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     info: AssetInformation,
     side: Side,
     quote: SwapContext['quote'],
-    algod: algosdk.Algodv2
+    algod: algosdk.Algodv2,
   ): Promise<bigint> {
     const isFixedOutput = quote?.type === 'fixed-output';
     // `amount` is the caller's original request, before adjustQuoteParams changed it; `quote`
@@ -603,7 +610,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     assetId: bigint,
     amount: bigint,
     isBuy: boolean,
-    algod: algosdk.Algodv2
+    algod: algosdk.Algodv2,
   ): Promise<bigint> {
     if (amount === 0n) return 0n;
     const quoted = await this.quoteTax(address, assetId, amount, isBuy, algod);
@@ -623,7 +630,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     assetId: bigint,
     net: bigint,
     isBuy: boolean,
-    algod: algosdk.Algodv2
+    algod: algosdk.Algodv2,
   ): Promise<bigint> {
     let tax = await this.taxOn(address, info, assetId, net, isBuy, algod);
     for (let i = 0; i < 4; i++) {
@@ -644,7 +651,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     assetId: bigint,
     amount: bigint,
     isBuy: boolean,
-    algod: algosdk.Algodv2
+    algod: algosdk.Algodv2,
   ): Promise<bigint | null> {
     if (this.quoteUnsupported) return null;
     try {
@@ -666,7 +673,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
           // A rekeyed wallet's transactions are authorized by another account; without this,
           // algod rejects the unsigned call and no rekeyed wallet could get a quote.
           fixSigners: true,
-        })
+        }),
       );
       const failure = res.simulateResponse.txnGroups[0]?.failureMessage;
       if (failure) throw new Error(failure);
@@ -688,15 +695,11 @@ export class FirstStageMiddleware implements SwapMiddleware {
     if (amount !== 0n) return;
     throw new Error(
       'FirstStageMiddleware cannot size the tax: the quote carries no amount. Build the swap ' +
-        'from a quote returned by DeflexClient.newQuote(), not a raw fetchQuote() response.'
+        'from a quote returned by DeflexClient.newQuote(), not a raw fetchQuote() response.',
     );
   }
 
-  private memo<T>(
-    store: Map<string, CacheEntry<T>>,
-    key: string,
-    factory: () => Promise<T>
-  ): Promise<T> {
+  private memo<T>(store: Map<string, CacheEntry<T>>, key: string, factory: () => Promise<T>): Promise<T> {
     const hit = store.get(key);
     if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
 
@@ -709,16 +712,10 @@ export class FirstStageMiddleware implements SwapMiddleware {
 
   /** Resolves (and caches) everything the hooks need to know about one side of the swap. */
   private getPlan(address: string, assetId: bigint, algod: algosdk.Algodv2): Promise<AssetPlan> {
-    return this.memo(this.planCache, `${address}:${assetId}`, () =>
-      this.buildPlan(address, assetId, algod)
-    );
+    return this.memo(this.planCache, `${address}:${assetId}`, () => this.buildPlan(address, assetId, algod));
   }
 
-  private async buildPlan(
-    address: string,
-    assetId: bigint,
-    algod: algosdk.Algodv2
-  ): Promise<AssetPlan> {
+  private async buildPlan(address: string, assetId: bigint, algod: algosdk.Algodv2): Promise<AssetPlan> {
     const info = await this.getAssetInfo(assetId, algod);
     const optedIn = await this.isOptedIn(address, assetId, algod);
 
@@ -735,11 +732,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     return { assetId, info, exempt, optedIn, userBoxExists };
   }
 
-  private async hasUserBox(
-    fsClient: FirstStageClient,
-    address: string,
-    assetId: bigint
-  ): Promise<boolean> {
+  private async hasUserBox(fsClient: FirstStageClient, address: string, assetId: bigint): Promise<boolean> {
     try {
       await fsClient.appClient.getBoxValue(getUserAssetBoxKey(Number(assetId), address));
       return true;
@@ -749,11 +742,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     }
   }
 
-  private async isExempt(
-    fsClient: FirstStageClient,
-    address: string,
-    assetId: bigint
-  ): Promise<boolean> {
+  private async isExempt(fsClient: FirstStageClient, address: string, assetId: bigint): Promise<boolean> {
     // Only the definite answer. `check_is_address_maybe_exempt_app` answers false on every
     // contract this version supports, and a FirstStage built between 2026-10-08 and the
     // MainNet upgrade does not have it at all.
@@ -764,11 +753,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     return exempt === true;
   }
 
-  private async isOptedIn(
-    address: string,
-    assetId: bigint,
-    algod: algosdk.Algodv2
-  ): Promise<boolean> {
+  private async isOptedIn(address: string, assetId: bigint, algod: algosdk.Algodv2): Promise<boolean> {
     try {
       const info = await algod.accountAssetInformation(address, Number(assetId)).do();
       return Boolean(info && info['assetHolding']);
@@ -778,25 +763,15 @@ export class FirstStageMiddleware implements SwapMiddleware {
     }
   }
 
-  public getAssetInfo(
-    assetId: bigint,
-    algod?: algosdk.Algodv2
-  ): Promise<AssetInformation | null> {
+  public getAssetInfo(assetId: bigint, algod?: algosdk.Algodv2): Promise<AssetInformation | null> {
     if (!assetId) return Promise.resolve(null);
     const client = this.resolveAlgod(algod);
-    return this.memo(this.assetInfoCache, assetId.toString(), () =>
-      this.fetchAssetInfo(assetId, client)
-    );
+    return this.memo(this.assetInfoCache, assetId.toString(), () => this.fetchAssetInfo(assetId, client));
   }
 
-  private async fetchAssetInfo(
-    assetId: bigint,
-    algod: algosdk.Algodv2
-  ): Promise<AssetInformation | null> {
+  private async fetchAssetInfo(assetId: bigint, algod: algosdk.Algodv2): Promise<AssetInformation | null> {
     try {
-      const res = await algod
-        .getApplicationBoxByName(this.appId, getBoxKeyForAsset(Number(assetId)))
-        .do();
+      const res = await algod.getApplicationBoxByName(this.appId, getBoxKeyForAsset(Number(assetId))).do();
       const buf = new Uint8Array(res.value);
 
       if (buf.length < MIN_ASSET_BOX_LENGTH) {
@@ -813,11 +788,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     }
   }
 
-  private async getUserBalance(
-    address: string,
-    assetId: bigint,
-    algod: algosdk.Algodv2
-  ): Promise<bigint> {
+  private async getUserBalance(address: string, assetId: bigint, algod: algosdk.Algodv2): Promise<bigint> {
     try {
       const info = await algod.accountAssetInformation(address, Number(assetId)).do();
       return BigInt(info['assetHolding']?.amount ?? 0);
