@@ -124,7 +124,7 @@ export interface FirstStageMiddlewareOptions {
 
 export class FirstStageMiddleware implements SwapMiddleware {
   readonly name = 'FirstStageDeflex';
-  readonly version = '1.0.2';
+  readonly version = '2.0.0';
   private readonly appId: bigint;
   private readonly fsReferralAddress?: string;
 
@@ -526,6 +526,32 @@ export class FirstStageMiddleware implements SwapMiddleware {
     }
 
     return txns;
+  }
+
+  /**
+   * The tax a quoted swap pays on each side, in base units of that side's asset - what a swap
+   * page shows beside the router's figure. Two of the four cases are already net, because
+   * adjustQuoteParams changed what the router was asked; the other two are not:
+   * a fixed-input buy delivers `quote.quote - to`, and a fixed-output sell spends
+   * `quote.quote + from`. Exempt wallets and assets that are not First Stage pay 0.
+   */
+  async swapTax(
+    quote: NonNullable<SwapContext['quote']>,
+    address: string,
+    algodClient?: algosdk.Algodv2
+  ): Promise<{ from: bigint; to: bigint }> {
+    const algod = this.resolveAlgod(algodClient);
+    const side = async (assetId: bigint, s: Side): Promise<bigint> => {
+      if (!assetId) return 0n;
+      const plan = await this.getPlan(address, assetId, algod);
+      if (!plan.info || plan.exempt) return 0n;
+      return this.calculateTax(address, assetId, plan.info, s, quote, algod);
+    };
+    const [from, to] = await Promise.all([
+      side(BigInt(quote.fromASAID ?? 0), 'from'),
+      side(BigInt(quote.toASAID ?? 0), 'to'),
+    ]);
+    return { from, to };
   }
 
   /**
