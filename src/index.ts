@@ -41,6 +41,18 @@ const TXNS_PER_HOOK = 1;
 
 /** Whether the upgraded contract pays a hook out of this asset's tax. */
 const paysHook = (info: AssetInformation | null): boolean => Boolean(info?.hook_app_id);
+
+/**
+ * Two `increase_budget` calls for an asset in tax mode 2: its tax settles into another asset
+ * (USDC, say) through its own tax pool, and the protocol fee out of that asset into ALGO
+ * through the adapter's route. Two pools, their holdings of three assets, the route box and
+ * the tax pool's record are more than the top and bottom calls and one padding call hold -
+ * FirstStage's own settlement test measures it. Only those assets pay these slots.
+ */
+const TXNS_PER_TAX_POOL = 2;
+
+/** Whether the upgraded contract settles this asset's tax through a tax pool (mode 2). */
+const settlesInTaxAsset = (info: AssetInformation | null): boolean => info?.tax_mode === 2n;
 const TXNS_PER_OPT_IN = 1;
 
 /**
@@ -99,6 +111,8 @@ interface AppConfig {
    * by its "amm" box. 0 on a FirstStage without one, which settles nothing in the trade.
    */
   adapterAppId: bigint;
+  /** The Pact factory the adapter proves a Pact pool against, from its global state; 0 if none. */
+  pactFactoryId: bigint;
 }
 
 export interface FirstStageMiddlewareOptions {
@@ -172,6 +186,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
         admin: address('global_admin'),
         poolAppId: BigInt(find('pool_app_id')?.uint ?? 0),
         adapterAppId: await this.readBoxUint(algod, enc.encode('amm')),
+        pactFactoryId: await this.readAdapterFactory(algod),
       };
     });
   }
@@ -199,6 +214,45 @@ export class FirstStageMiddleware implements SwapMiddleware {
   }
 
   /** A FirstStage box holding one uint64, or 0 when the box does not exist. */
+  /**
+   * What a mode-2 asset's tax swap reaches: its tax pool and that pool's app, and the
+   * adapter's route out of the tax asset into ALGO. The route is the protocol admin's choice,
+   * one pool per tax asset, stored in the adapter's "r" box as the pool's address, its app and
+   * which DEX it is; with no route set, the adapter skips that swap and the trade still goes.
+   */
+  private async taxPoolRoute(
+    info: AssetInformation,
+    assetId: bigint,
+    algod: algosdk.Algodv2,
+    tinymanApp: bigint
+  ): Promise<{ taxAsset: bigint; taxPool: string; taxPoolApp: bigint; routePool?: string; routeApp?: bigint }> {
+    const taxAsset = info.tax_asset_id ?? 0n;
+    const taxPoolApp = (await this.readBoxUint(algod, prefixedAssetKey('x', assetId))) || tinymanApp;
+    const { adapterAppId } = await this.getAppConfig(algod);
+    let routePool: string | undefined;
+    let routeApp: bigint | undefined;
+    try {
+      const res = await algod.getApplicationBoxByName(adapterAppId, prefixedAssetKey('r', taxAsset)).do();
+      const raw = new Uint8Array(res.value);
+      routePool = algosdk.encodeAddress(raw.slice(0, 32));
+      routeApp = algosdk.decodeUint64(raw.slice(32, 40), 'bigint') || tinymanApp;
+    } catch (err: any) {
+      if (!isNotFound(err)) throw err;
+    }
+    return { taxAsset, taxPool: info.tax_asset_pool ?? ZERO_ADDRESS, taxPoolApp, routePool, routeApp };
+  }
+
+  /** The adapter's `pact_factory_id`: a mode-2 swap through a Pact pool reads it to prove the pool. */
+  private async readAdapterFactory(algod: algosdk.Algodv2): Promise<bigint> {
+    const adapter = await this.readBoxUint(algod, enc.encode('amm'));
+    if (!adapter) return 0n;
+    const app = await algod.getApplicationByID(adapter).do();
+    const entry = (app.params.globalState ?? []).find(
+      (kv) => Buffer.from(typeof kv.key === 'string' ? Buffer.from(kv.key, 'base64') : kv.key).toString() === 'pact_factory_id'
+    );
+    return BigInt(entry?.value.uint ?? 0);
+  }
+
   private async readBoxUint(algod: algosdk.Algodv2, name: Uint8Array): Promise<bigint> {
     try {
       const res = await algod.getApplicationBoxByName(this.appId, name).do();
@@ -245,6 +299,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
       // is frozen at rest, so without them the swap transfer itself cannot settle.
       reservedTxns += TXNS_PER_FIRST_STAGE_ASSET;
       if (paysHook(plan.info)) reservedTxns += TXNS_PER_HOOK;
+      if (settlesInTaxAsset(plan.info)) reservedTxns += TXNS_PER_TAX_POOL;
       if (!plan.userBoxExists) reservedTxns += TXNS_PER_FREEZE;
 
       // fixed-input sell: the requested amount has to cover both the swap and the tax, so the
@@ -368,6 +423,44 @@ export class FirstStageMiddleware implements SwapMiddleware {
           ...validity,
         });
         for (const t of padTx.transactions) txns.push({ txn: t, signer });
+      }
+
+      if (settlesInTaxAsset(plan.info) && appConfig.adapterAppId) {
+        const route = await this.taxPoolRoute(plan.info, assetId, algod, appConfig.poolAppId);
+        const adapterAccount = algosdk.getApplicationAddress(appConfig.adapterAppId).toString();
+        const reserve = (await algod.getAssetByID(Number(assetId)).do()).params.reserve;
+        const projectAccount = (reserve ?? ZERO_ADDRESS).toString();
+        // A pool's holding, or its local state in an AMM, is only available when the account
+        // and the asset or app are named on the SAME call - so each side goes on its own call.
+        // The route side: turning the tax asset into ALGO for the protocol fee.
+        const routeSide = await fsClient.createTransaction.increaseBudget({
+          sender: address,
+          signer,
+          args: [],
+          appReferences: [appConfig.adapterAppId, ...(route.routeApp ? [route.routeApp] : [])],
+          accountReferences: route.routePool ? [route.routePool] : [],
+          assetReferences: [route.taxAsset, 0n],
+          boxReferences: [
+            { appId: appConfig.adapterAppId, name: prefixedAssetKey('r', route.taxAsset) },
+            { appId: this.appId, name: prefixedAssetKey('x', assetId) },
+          ],
+          note: enc.encode(`fs-route-${assetId}`),
+          ...validity,
+        });
+        // The tax pool side: the token in, the tax asset out, and everyone paid in it.
+        const poolSide = await fsClient.createTransaction.increaseBudget({
+          sender: address,
+          signer,
+          args: [],
+          // The Pact factory too: the adapter proves a Pact tax pool by reading it.
+          appReferences: [route.taxPoolApp, ...(appConfig.pactFactoryId ? [appConfig.pactFactoryId] : [])],
+          // And the admin: in mode 2 the protocol's fee, turned to ALGO, is paid out in the trade.
+          accountReferences: [route.taxPool, projectAccount, adapterAccount, appConfig.admin],
+          assetReferences: [route.taxAsset, assetId],
+          note: enc.encode(`fs-taxpool-${assetId}`),
+          ...validity,
+        });
+        for (const t of [...routeSide.transactions, ...poolSide.transactions]) txns.push({ txn: t, signer });
       }
     }
 
