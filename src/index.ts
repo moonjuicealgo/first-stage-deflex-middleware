@@ -124,7 +124,7 @@ export interface FirstStageMiddlewareOptions {
 
 export class FirstStageMiddleware implements SwapMiddleware {
   readonly name = 'FirstStageDeflex';
-  readonly version = '2.0.0';
+  readonly version = '2.0.1';
   private readonly appId: bigint;
   private readonly fsReferralAddress?: string;
 
@@ -663,6 +663,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
           txnGroups: [],
           allowEmptySignatures: true,
           allowUnnamedResources: true,
+          // A rekeyed wallet's transactions are authorized by another account; without this,
+          // algod rejects the unsigned call and no rekeyed wallet could get a quote.
+          fixSigners: true,
         })
       );
       const failure = res.simulateResponse.txnGroups[0]?.failureMessage;
