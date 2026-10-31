@@ -37,6 +37,17 @@ const paysHook = (info: AssetInformation | null): boolean => Boolean(info?.hook_
  */
 const TXNS_PER_TAX_POOL = 2;
 
+/**
+ * `increase_budget` pads for a trade whose tax FirstStage settles in the trade, through its AMM
+ * adapter. A four-hop route measured 8,250 opcodes for the whole group against the 4,200 its own
+ * six app calls pool; seven pads cover that with room to spare.
+ */
+const TXNS_PER_SETTLEMENT = 7;
+
+/** Whether FirstStage swaps this side's tax through its adapter: only a taxed side settles. */
+const settlesOnSide = (info: AssetInformation | null, isSell: boolean, adapterAppId: bigint): boolean =>
+  adapterAppId !== 0n && !!info && (isSell ? info.sell_tax : info.buy_tax);
+
 /** Whether the upgraded contract settles this asset's tax through a tax pool (mode 2). */
 const settlesInTaxAsset = (info: AssetInformation | null): boolean => info?.tax_mode === 2n;
 const TXNS_PER_OPT_IN = 1;
@@ -295,6 +306,8 @@ export class FirstStageMiddleware implements SwapMiddleware {
       if (paysHook(plan.info)) reservedTxns += TXNS_PER_HOOK;
       if (settlesInTaxAsset(plan.info)) reservedTxns += TXNS_PER_TAX_POOL;
       if (!plan.userBoxExists) reservedTxns += TXNS_PER_FREEZE;
+      const { adapterAppId } = await this.getAppConfig(algod);
+      if (settlesOnSide(plan.info, assetId === fromASAID, adapterAppId)) reservedTxns += TXNS_PER_SETTLEMENT;
 
       // fixed-input sell: the requested amount has to cover both the swap and the tax, so the
       // router is quoted on the post-tax remainder.
@@ -402,8 +415,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
           userBalance: await this.getUserBalance(address, assetId, algod),
         },
         boxReferences: boxes,
-        // The upgraded FirstStage no longer pays the admin inside a trade, and the two settlement
-        // boxes above take the slot it used: 6 boxes, the asset and the burn wallet are 8 of 8.
+        // The two settlement boxes above take the admin's slot here: 6 boxes, the asset and the
+        // burn wallet are 8 of 8. The admin is still paid in the trade; a pad before the bottom
+        // call names it (see afterSwap).
         accountReferences: appConfig.adapterAppId
           ? [appConfig.burnWallet]
           : [appConfig.burnWallet, appConfig.admin],
@@ -528,6 +542,23 @@ export class FirstStageMiddleware implements SwapMiddleware {
         firstValidRound: BigInt(suggestedParams.firstValid),
         lastValidRound: BigInt(suggestedParams.lastValid),
       });
+
+      // Settling swaps the tax inside the bottom call, which with a multi-hop route ahead of it
+      // overruns the group's pooled opcode budget. Each pad adds 700. They go before the tax
+      // transfer, which has to sit directly ahead of the bottom call it is an argument of.
+      if (settlesOnSide(plan.info, side === 'from', appConfig.adapterAppId)) {
+        for (let n = 0; n < TXNS_PER_SETTLEMENT; n++) {
+          const pad = await fsClient.createTransaction.increaseBudget({
+            sender: address,
+            signer,
+            args: [],
+            note: enc.encode(`fs-budget-${assetId}-${n}`),
+            firstValidRound: BigInt(suggestedParams.firstValid),
+            lastValidRound: BigInt(suggestedParams.lastValid),
+          });
+          for (const t of pad.transactions) txns.push({ txn: t, signer });
+        }
+      }
 
       for (const t of bottomTx.transactions) txns.push({ txn: t, signer });
     }
