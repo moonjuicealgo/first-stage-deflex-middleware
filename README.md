@@ -1,6 +1,6 @@
 # first-stage-deflex-middleware
 
-**FirstStageMiddleware** is middleware for TxnLab's [Deflex](https://github.com/TxnLab/deflex-js) router that lets it swap First Stage assets on Algorand. It adds the calls the First Stage contract needs around the swap, pays the asset's buy or sell tax, and handles both **fixed-input** and **fixed-output** swaps.
+**FirstStageMiddleware** is middleware for TxnLab's [Haystack Router](https://github.com/TxnLab/haystack-js) router that lets it swap First Stage assets on Algorand. It adds the calls the First Stage contract needs around the swap, pays the asset's buy or sell tax, and handles both **fixed-input** and **fixed-output** swaps.
 
 Published on npm: [first-stage-deflex-middleware](https://www.npmjs.com/package/first-stage-deflex-middleware)
 
@@ -8,11 +8,11 @@ Published on npm: [first-stage-deflex-middleware](https://www.npmjs.com/package/
 
 ## Features
 
-- Swaps any **First Stage asset** through the Deflex router, in either direction.
+- Swaps any **First Stage asset** through the Haystack router, in either direction.
 - Pays **buy and sell taxes** exactly, using the contract's own quote: per-side rates, hook shares and volume-based multipliers included.
-- Works with **fixed-input** and **fixed-output** swaps.
+- Works with **fixed-input** swaps, and **fixed-output** on sides with no tax. See [Fixed-output swaps](#fixed-output-swaps).
 - **`swapTax`** returns the tax on each side of a quote, so a swap page can show what the trade really costs.
-- Optionally names a First Stage **referral address**, which collects a share of the tax.
+- Optionally names a First Stage **referral address**, which earns half the protocol fee on each taxed trade. See [Referral share](#referral-share).
 - Reads the deployment it talks to at runtime, so it works **before and after First Stage's contract upgrade** without a change on your side (see below).
 
 ---
@@ -20,28 +20,28 @@ Published on npm: [first-stage-deflex-middleware](https://www.npmjs.com/package/
 ## Installation
 
 ```bash
-npm install first-stage-deflex-middleware @txnlab/deflex algosdk
+npm install first-stage-deflex-middleware @txnlab/haystack-router algosdk
 # or with yarn
-yarn add first-stage-deflex-middleware @txnlab/deflex algosdk
+yarn add first-stage-deflex-middleware @txnlab/haystack-router algosdk
 ```
 
-`@txnlab/deflex` (1.3 or later) and `algosdk` (3.x) are peer dependencies.
+`@txnlab/haystack-router` (3.0 or later) and `algosdk` (3.x) are peer dependencies.
 
 ## Example usage
 
 ```ts
-import { DeflexClient } from '@txnlab/deflex'
+import { RouterClient } from '@txnlab/haystack-router'
 import { FirstStageMiddleware } from 'first-stage-deflex-middleware'
 
 const firstStage = new FirstStageMiddleware({ referralAddress: 'YOUR_REFERRAL_ADDRESS' })
 
-const deflex = new DeflexClient({
+const router = new RouterClient({
   apiKey: 'YOUR_API_KEY_HERE',
   middleware: [firstStage],
 })
 
 // Quote. `address` is required: the middleware sizes its calls and the tax for that wallet.
-const quote = await deflex.newQuote({
+const quote = await router.newQuote({
   address: 'YOUR_WALLET_ADDRESS',
   fromASAID: 2154668640, // MOOJ
   toASAID: 0, // ALGO
@@ -53,7 +53,7 @@ const quote = await deflex.newQuote({
 const tax = await firstStage.swapTax(quote, 'YOUR_WALLET_ADDRESS')
 
 // Swap
-const swap = await deflex.newSwap({
+const swap = await router.newSwap({
   quote,
   address: 'YOUR_WALLET_ADDRESS',
   signer: yourTransactionSigner,
@@ -75,6 +75,31 @@ The middleware already moves the router's request in two of the four cases, so t
 | fixed-output, buying a First Stage asset | input needed, already covering the buy tax | `quote.quote` |
 | fixed-input, buying a First Stage asset | output **before** the buy tax | `quote.quote - tax.to` |
 | fixed-output, selling a First Stage asset | input **before** the sell tax | `quote.quote + tax.from` |
+
+## The buy tax buffer
+
+FirstStage taxes a buy on what actually arrives, so if the price improves between the quote and the trade, a tax sized from the quote comes up short and the trade fails with `Insufficient tax payment`. The middleware therefore pays a buy's tax on 0.5% more than the quote. Set `buyTaxBufferBps` to change it.
+
+The contract refunds an overpayment of one whole token or more, in the same call. A smaller one is not refunded, and stays in the contract. On a 3% tax the buffer is at most about 0.015% of the trade. `swapTax` reports the tax without the buffer.
+
+## Fixed-output swaps
+
+Quoting fixed-output works on any token, and `swapTax` reports the tax on it. Building one on a taxed side does not: `beforeSwap` throws. The router sends a slippage buffer on top of a fixed-output swap and takes back what it did not use, and FirstStage refuses a bracket whose tokens both left and came back (`Send or receive in one transfer, not both`), or where more arrived than the tax was sized for (`Insufficient tax payment`).
+
+To let someone type what they want to receive, quote fixed-output, then swap the input it gives as fixed-input. In simulations on MainNet that landed within 0.01% above the amount asked for.
+
+```ts
+const estimate = await router.newQuote({ ...params, type: 'fixed-output' })
+const tax = await firstStage.swapTax(estimate, address)
+const quote = await router.newQuote({ ...params, type: 'fixed-input', amount: estimate.quote + tax.from })
+```
+
+## Referral share
+
+The protocol's fee is 5% of the tax (`protocol_fee_bps`), and half of it goes to the referrer a trade names, paid in ALGO inside the trade. On a 3% token that is about 7.5 bps of the trade. No approval is needed. Two conditions:
+
+- **Name the referrer** as the bottom call's last argument, which `referralAddress` does. The zero address, or the trader's own, earns nothing.
+- **Let the tax settle.** The fee is what the bottom call swaps through the AMM adapter, so a group that does not name the adapter pays no one. The middleware names it, along with the route the swap needs.
 
 ## Notes for integrators
 

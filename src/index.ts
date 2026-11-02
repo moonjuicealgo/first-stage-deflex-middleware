@@ -1,5 +1,5 @@
 import algosdk, { TransactionWithSigner, makePaymentTxnWithSuggestedParamsFromObject } from 'algosdk';
-import type { SwapMiddleware, SwapContext, QuoteContext, FetchQuoteParams, QuoteType } from '@txnlab/deflex';
+import type { SwapMiddleware, SwapContext, QuoteContext, FetchQuoteParams, QuoteType } from '@txnlab/haystack-router';
 import { FirstStageClient } from './FirstStageClientMinimal.js';
 import { getBoxKeyForAsset, getUserAssetBoxKey, getExemptWalletBoxKey, ZERO_ADDRESS } from './boxes.js';
 import { decodeAssetBox, type AssetInformation } from './decoders.js';
@@ -18,6 +18,8 @@ const MIN_ASSET_BOX_LENGTH = 249;
 const TXNS_PER_FIRST_STAGE_ASSET = 3;
 /** MBR payment + freeze call, needed once per asset to create the user box. */
 const TXNS_PER_FREEZE = 2;
+/** A buy's tax is sized this far above the quote: see `buyTaxBufferBps`. */
+const DEFAULT_BUY_TAX_BUFFER_BPS = 50;
 /**
  * An `increase_budget` call for an asset whose tax pays a hook: the hook's account and its
  * bookkeeping need references and opcode budget that the top and bottom calls have no room
@@ -39,14 +41,23 @@ const TXNS_PER_TAX_POOL = 2;
 
 /**
  * `increase_budget` pads for a trade whose tax FirstStage settles in the trade, through its AMM
- * adapter. A four-hop route measured 8,250 opcodes for the whole group against the 4,200 its own
- * six app calls pool; seven pads cover that with room to spare.
+ * adapter. Measured on MainNet's real routes, up to four router calls: they pass with none, because
+ * every inner app call adds to the group's pool. It was seven, which left a token taxed on both
+ * sides of a swap too small a group to route at all. One stays as a margin.
  */
-const TXNS_PER_SETTLEMENT = 7;
+const TXNS_PER_SETTLEMENT = 1;
 
-/** Whether FirstStage swaps this side's tax through its adapter: only a taxed side settles. */
-const settlesOnSide = (info: AssetInformation | null, isSell: boolean, adapterAppId: bigint): boolean =>
-  adapterAppId !== 0n && !!info && (isSell ? info.sell_tax : info.buy_tax);
+/**
+ * Whether FirstStage swaps this side's tax through its adapter: a taxed side with a pool to swap
+ * through. With no pool the tax stays in the token and the pads buy nothing, and their seven slots
+ * can leave the router too small a group to find any route: a token graduated into a non-ALGO pool
+ * has no main pool, and could not be quoted.
+ */
+const settlesOnSide = (info: AssetInformation | null, isSell: boolean, adapterAppId: bigint): boolean => {
+  if (adapterAppId === 0n || !info || !(isSell ? info.sell_tax : info.buy_tax)) return false;
+  const pool = info.tax_mode === 2n ? info.tax_asset_pool : info.main_pool;
+  return !!pool && pool !== ZERO_ADDRESS;
+};
 
 /** Whether the upgraded contract settles this asset's tax through a tax pool (mode 2). */
 const settlesInTaxAsset = (info: AssetInformation | null): boolean => info?.tax_mode === 2n;
@@ -115,6 +126,14 @@ interface AppConfig {
 export interface FirstStageMiddlewareOptions {
   /** First Stage referral address, which collects a share of the tax volume. */
   referralAddress?: string;
+  /** `increase_budget` calls for a settling side. The default is what a four-hop route needs. */
+  settlementPads?: number;
+  /**
+   * How far above the quote a buy's tax is sized, in basis points. The contract taxes what
+   * arrives, so a price that improves after the quote would otherwise leave the tax short and
+   * fail the trade. FirstStage refunds an overpayment of one whole token or more.
+   */
+  buyTaxBufferBps?: number;
   /** FirstStage application to talk to. Defaults to the MainNet deployment. */
   appId?: bigint | number;
 }
@@ -133,11 +152,15 @@ export class FirstStageMiddleware implements SwapMiddleware {
   private readonly appConfigCache = new Map<string, CacheEntry<AppConfig>>();
   /** Set once the app turns out to have no `quote_tax_amount_side`: the stored rates are used. */
   private quoteUnsupported = false;
+  private readonly settlementPads: number;
+  private readonly buyTaxBufferBps: bigint;
 
   constructor(config?: string | FirstStageMiddlewareOptions) {
     const options = typeof config === 'string' ? { referralAddress: config } : (config ?? {});
     this.appId = BigInt(options.appId ?? FIRST_STAGE_MAINNET_APP_ID);
     this.fsReferralAddress = options.referralAddress;
+    this.settlementPads = options.settlementPads ?? TXNS_PER_SETTLEMENT;
+    this.buyTaxBufferBps = BigInt(options.buyTaxBufferBps ?? DEFAULT_BUY_TAX_BUFFER_BPS);
   }
 
   /**
@@ -307,7 +330,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
       if (settlesInTaxAsset(plan.info)) reservedTxns += TXNS_PER_TAX_POOL;
       if (!plan.userBoxExists) reservedTxns += TXNS_PER_FREEZE;
       const { adapterAppId } = await this.getAppConfig(algod);
-      if (settlesOnSide(plan.info, assetId === fromASAID, adapterAppId)) reservedTxns += TXNS_PER_SETTLEMENT;
+      if (settlesOnSide(plan.info, assetId === fromASAID, adapterAppId)) reservedTxns += this.settlementPads;
 
       // fixed-input sell: the requested amount has to cover both the swap and the tax, so the
       // router is quoted on the post-tax remainder.
@@ -349,6 +372,19 @@ export class FirstStageMiddleware implements SwapMiddleware {
       if (!assetId) continue;
 
       const plan = await this.getPlan(address, assetId, algod);
+
+      // A fixed-output swap sends a slippage buffer on top and takes back what it did not use.
+      // On a taxed side FirstStage refuses that: tokens both left and came back, or more arrived
+      // than the tax was sized for. Say so here, rather than as a failed group at submission.
+      if (context.quote?.type === 'fixed-output' && plan.info && !plan.exempt) {
+        const side: Side = assetId === fromASAID ? 'from' : 'to';
+        if ((await this.calculateTax(address, assetId, plan.info, side, context.quote, algod)) > 0n) {
+          throw new Error(
+            `FirstStageMiddleware: asset ${assetId} is taxed on this side, so this swap cannot be built as fixed-output. ` +
+              'Quote fixed-output to find the input, then swap that input as fixed-input.',
+          );
+        }
+      }
 
       // Quotes are requested with optIn: false, so any opt-in the swap needs is ours to add.
       if (!plan.optedIn) {
@@ -508,7 +544,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
         sender: address,
         receiver: fsClient.appClient.appAddress,
         assetIndex: Number(assetId),
-        amount: await this.calculateTax(address, assetId, plan.info, side, quote, algod),
+        amount: await this.calculateTax(address, assetId, plan.info, side, this.bufferBuy(quote, side), algod),
         suggestedParams,
       });
 
@@ -547,7 +583,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
       // overruns the group's pooled opcode budget. Each pad adds 700. They go before the tax
       // transfer, which has to sit directly ahead of the bottom call it is an argument of.
       if (settlesOnSide(plan.info, side === 'from', appConfig.adapterAppId)) {
-        for (let n = 0; n < TXNS_PER_SETTLEMENT; n++) {
+        for (let n = 0; n < this.settlementPads; n++) {
           const pad = await fsClient.createTransaction.increaseBudget({
             sender: address,
             signer,
@@ -599,6 +635,13 @@ export class FirstStageMiddleware implements SwapMiddleware {
    * and a buy on everything that arrived. Underpayment fails the group with "Insufficient tax
    * payment"; overpayment is refunded.
    */
+  /** The quote a fixed-input buy's tax payment is sized from: what arrives if the price improves. */
+  private bufferBuy(quote: SwapContext['quote'], side: Side): SwapContext['quote'] {
+    if (side !== 'to' || !quote || quote.type === 'fixed-output') return quote;
+    const routed = BigInt(quote.quote ?? 0);
+    return { ...quote, quote: routed + (routed * this.buyTaxBufferBps + 9_999n) / 10_000n } as SwapContext['quote'];
+  }
+
   private async calculateTax(
     address: string,
     assetId: bigint,
@@ -652,8 +695,11 @@ export class FirstStageMiddleware implements SwapMiddleware {
 
   /**
    * The tax when it is itself part of what is taxed: `net` moves and the tax moves with it, so
-   * the base is net + tax. Converges in a step or two; the last unit is rounded up, since an
-   * overpayment is refunded and an underpayment fails.
+   * the base is net + tax. Iterating from the quote on `net` closes only (1 - rate) of the gap a
+   * round: at 9%, four rounds stopped dozens of units short and the sell was refused. So it
+   * starts from the closed form for a flat rate, `net * q / (net - q)`, and the quotes only
+   * confirm it, which also covers a rate that moves with size. The last unit is rounded up,
+   * since an overpayment is refunded and an underpayment fails.
    */
   private async taxOnTop(
     address: string,
@@ -663,8 +709,9 @@ export class FirstStageMiddleware implements SwapMiddleware {
     isBuy: boolean,
     algod: algosdk.Algodv2,
   ): Promise<bigint> {
-    let tax = await this.taxOn(address, info, assetId, net, isBuy, algod);
-    for (let i = 0; i < 4; i++) {
+    const first = await this.taxOn(address, info, assetId, net, isBuy, algod);
+    let tax = net > first ? (net * first + (net - first) - 1n) / (net - first) : first;
+    for (let i = 0; i < 8; i++) {
       const next = await this.taxOn(address, info, assetId, net + tax, isBuy, algod);
       if (next <= tax) break;
       tax = next;
@@ -726,7 +773,7 @@ export class FirstStageMiddleware implements SwapMiddleware {
     if (amount !== 0n) return;
     throw new Error(
       'FirstStageMiddleware cannot size the tax: the quote carries no amount. Build the swap ' +
-        'from a quote returned by DeflexClient.newQuote(), not a raw fetchQuote() response.',
+        'from a quote returned by RouterClient.newQuote(), not a raw fetchQuote() response.',
     );
   }
 

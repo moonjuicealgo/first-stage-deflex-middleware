@@ -184,6 +184,23 @@ async function run(label: string, buying: boolean, amountIn: bigint): Promise<bo
   const strict = await simulate(group, false);
   if (!strict.failureMessage) {
     console.log('  strict simulate: OK');
+    if (env.FS_TEST_HOOK) {
+      const hook = BigInt(env.FS_TEST_HOOK);
+      const hookAccount = algosdk.getApplicationAddress(hook).toString();
+      let calls = 0;
+      let paid = 0n;
+      const walk = (inner: algosdk.modelsv2.PendingTransactionResponse[] = []) => {
+        for (const it of inner) {
+          const t = it.txn.txn;
+          if (t.applicationCall?.appIndex === hook) calls++;
+          if (t.assetTransfer?.receiver.toString() === hookAccount) paid += t.assetTransfer.amount;
+          if (t.payment?.receiver.toString() === hookAccount) paid += t.payment.amount;
+          walk(it.innerTxns);
+        }
+      };
+      for (const r of strict.txnResults) walk(r.txnResult.innerTxns);
+      console.log(`  hook ${hook}: ${calls} call(s), ${paid} base units paid to its account`);
+    }
     // With the wallet's key (TestNet only), send it too: a real confirmation, and holdings for
     // a sell to be tested against.
     if (env.FS_TEST_MNEMONIC_FILE) {
